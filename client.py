@@ -112,6 +112,10 @@ def recv_frame(sock: socket.socket) -> Optional[tuple[dict, bytes]]:
     header_len  = struct.unpack(">I", size_buf[:4])[0]
     payload_len = struct.unpack(">I", size_buf[4:8])[0]
 
+    # Sanity check — a zero or huge header means garbage data on the socket
+    if header_len == 0 or header_len > 65536:
+        return None
+
     header_bytes  = _recv_exact(sock, header_len)
     if header_bytes is None:
         return None
@@ -221,6 +225,7 @@ class NoEyesClient:
             (RECEIVE_BASE / subfolder).mkdir(parents=True, exist_ok=True)
 
         backoff = 2
+        session_start = 0.0
         while True:
             if not self.connect():
                 if not self.reconnect or self._quit:
@@ -229,6 +234,8 @@ class NoEyesClient:
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 60)
                 continue
+
+            session_start = time.monotonic()
             backoff = 2
 
             # Send join event
@@ -239,6 +246,11 @@ class NoEyesClient:
                 "room":     self.room,
             }
             if not self._send(join_header):
+                # Send failed immediately — avoid tight loop
+                if not self.reconnect or self._quit:
+                    return
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60)
                 continue
 
             # Announce our Ed25519 pubkey
@@ -267,11 +279,18 @@ class NoEyesClient:
                 print(utils.cinfo("\n[bye] Disconnected."))
                 return
 
-            print(utils.cwarn("[reconnect] Connection lost. Reconnecting…"))
+            # If the session lasted less than 5 seconds it was a bad connection,
+            # not a normal drop — apply backoff so we don't spin tight on localhost.
+            session_duration = time.monotonic() - session_start
+            if session_duration < 5.0:
+                backoff = min(backoff * 2, 60)
+
+            print(utils.cwarn(f"[reconnect] Connection lost. Reconnecting in {backoff}s…"))
             try:
                 self.sock.close()
             except OSError:
                 pass
+            time.sleep(backoff)
 
     # ------------------------------------------------------------------
     # Announce / pubkey
