@@ -1,143 +1,165 @@
 # FILE: server.py
 """
-server.py — NoEyes chat server.
+server.py — NoEyes chat server (asyncio rewrite).
 
 The server is a BLIND FORWARDER.  It reads only the plaintext header JSON
-(which contains routing metadata) and forwards the encrypted payload bytes
-verbatim without ever decrypting them.
+(routing metadata) and forwards the encrypted payload bytes verbatim.
+It has no keys, calls no decryption function, and cannot read any message.
 
-Wire protocol (unchanged):
+Why asyncio instead of threads:
+  - One OS thread handles all clients via an event loop.
+  - When a client is idle the coroutine is suspended with zero CPU cost.
+  - No GIL thrashing between idle threads → CPU drops to true idle → no heat.
+  - Memory per client: ~50 KB instead of ~8 MB (no per-client thread stack).
+
+Wire protocol (identical to v1 — clients unchanged):
     [4 bytes: header_len BE uint32]
     [4 bytes: payload_len BE uint32]
-    [header_len bytes: UTF-8 JSON]
-    [payload_len bytes: opaque encrypted bytes]
+    [header_len bytes: UTF-8 JSON — plaintext routing metadata]
+    [payload_len bytes: opaque encrypted bytes — never touched]
 
-Header JSON fields the server inspects (all others are forwarded untouched):
-    type      str   — "chat" | "system" | "privmsg" | "dh_init" | "dh_resp"
-                      | "pubkey_announce" | "command" | "heartbeat"
-    room      str   — room name for broadcast routing
-    to        str   — target username for point-to-point delivery (privmsg / DH)
-    from      str   — sender username
-    event     str   — "join" | "leave" | "nick" | "users_req" | "users_resp"
-    username  str   — used by join/nick events
-    nick      str   — new nickname (nick event)
-    vk_hex    str   — Ed25519 verify key hex (pubkey_announce only)
+Header fields the server inspects:
+    type       "chat"|"system"|"privmsg"|"dh_init"|"dh_resp"
+               |"pubkey_announce"|"command"|"heartbeat"
+    room       room name for broadcast routing
+    to         target username for point-to-point delivery
+    from       sender username
+    event      "join"|"leave"|"nick"|"users_req"|"join_room"
+    username   used by join/nick events
+    nick       new nickname (nick event)
+    vk_hex     Ed25519 verify key hex (pubkey_announce only)
 
-SECURITY INVARIANTS:
-  - No call to Fernet, fernet, .decrypt(), or any private-key primitive.
+SECURITY INVARIANTS (unchanged from threaded version):
+  - Zero calls to Fernet / .decrypt() / any private-key primitive.
   - pubkey store holds ONLY verify-key hex strings, never signing keys.
-  - Server never derives shared DH keys; dh_init/dh_resp are forwarded opaque.
+  - Server never derives DH keys; dh_init/dh_resp forwarded opaque.
 """
 
+import asyncio
 import json
-import socket
-import struct
-import threading
-import time
 import logging
+import struct
+import time
 from collections import defaultdict, deque
 from typing import Optional
 
 logger = logging.getLogger("noeyes.server")
 
 # ---------------------------------------------------------------------------
-# Framing helpers
+# Async framing helpers
 # ---------------------------------------------------------------------------
 
-HEADER_MAGIC_SIZE = 4   # bytes for header_len
-PAYLOAD_MAGIC_SIZE = 4  # bytes for payload_len
+
+async def _read_exact(reader: asyncio.StreamReader, n: int) -> Optional[bytes]:
+    """Read exactly *n* bytes; return None on EOF/error."""
+    try:
+        data = await reader.readexactly(n)
+        return data
+    except (asyncio.IncompleteReadError, ConnectionResetError, OSError):
+        return None
 
 
-def _recv_exact(sock: socket.socket, n: int) -> Optional[bytes]:
-    """Read exactly *n* bytes from *sock*; return None on EOF/error."""
-    buf = b""
-    while len(buf) < n:
-        try:
-            chunk = sock.recv(n - len(buf))
-        except OSError:
-            return None
-        if not chunk:
-            return None
-        buf += chunk
-    return buf
-
-
-def recv_frame(sock: socket.socket) -> Optional[tuple[dict, bytes]]:
+async def recv_frame(
+    reader: asyncio.StreamReader,
+) -> Optional[tuple[dict, bytes]]:
     """
-    Read one framed message from *sock*.
-
-    Returns (header_dict, payload_bytes) or None on connection loss.
-    The payload bytes are NOT decrypted — they are returned raw.
+    Read one frame from *reader*.
+    Returns (header_dict, raw_payload_bytes) or None on disconnect.
+    Payload bytes are NEVER decrypted — returned raw.
     """
-    size_buf = _recv_exact(sock, 8)
+    size_buf = await _read_exact(reader, 8)
     if size_buf is None:
         return None
-    header_len = struct.unpack(">I", size_buf[:4])[0]
+
+    header_len  = struct.unpack(">I", size_buf[:4])[0]
     payload_len = struct.unpack(">I", size_buf[4:8])[0]
 
-    header_bytes = _recv_exact(sock, header_len)
+    # Guard against malformed/oversized headers
+    if header_len > 65536:
+        logger.warning("Oversized header (%d bytes) — dropping connection", header_len)
+        return None
+
+    header_bytes = await _read_exact(reader, header_len)
     if header_bytes is None:
         return None
-    payload_bytes = _recv_exact(sock, payload_len) if payload_len else b""
-    if payload_bytes is None:
-        return None
+
+    payload_bytes = b""
+    if payload_len:
+        payload_bytes = await _read_exact(reader, payload_len)
+        if payload_bytes is None:
+            return None
 
     try:
         header = json.loads(header_bytes.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError):
-        logger.warning("Malformed header from client — dropping frame.")
+        logger.warning("Malformed header — dropping frame")
         return None
 
     return header, payload_bytes
 
 
-def send_frame(sock: socket.socket, header: dict, payload: bytes = b"") -> bool:
+async def send_frame(
+    writer: asyncio.StreamWriter,
+    header: dict,
+    payload: bytes = b"",
+) -> bool:
     """
-    Write one framed message to *sock*.
-
-    Returns False on send error.
+    Write one frame to *writer*.
+    Returns False if the connection is already closing.
     """
+    if writer.is_closing():
+        return False
     try:
-        header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
-        size_buf = struct.pack(">I", len(header_bytes)) + struct.pack(">I", len(payload))
-        sock.sendall(size_buf + header_bytes + payload)
+        hb = json.dumps(header, separators=(",", ":")).encode("utf-8")
+        frame = (
+            struct.pack(">I", len(hb)) +
+            struct.pack(">I", len(payload)) +
+            hb +
+            payload
+        )
+        writer.write(frame)
+        await writer.drain()
         return True
-    except OSError:
+    except (OSError, ConnectionResetError, BrokenPipeError):
         return False
 
 
 # ---------------------------------------------------------------------------
-# Client connection state
+# Client state
 # ---------------------------------------------------------------------------
 
 
 class ClientConn:
-    """Represents one connected client."""
+    """State for one connected client — no thread, no lock needed."""
 
-    def __init__(self, sock: socket.socket, addr: tuple):
-        self.sock     = sock
+    def __init__(
+        self,
+        writer:   asyncio.StreamWriter,
+        addr:     tuple,
+    ):
+        self.writer   = writer
         self.addr     = addr
-        self.username: str        = ""
-        self.room:     str        = "general"
-        self.vk_hex:   str        = ""
-        self._last_msg_times: deque = deque()
-        self.alive:    bool       = True
-        self._send_lock = threading.Lock()   # guards all writes to self.sock
+        self.username: str   = ""
+        self.room:     str   = "general"
+        self.vk_hex:   str   = ""
+        self.alive:    bool  = True
+        # Rate limiting: timestamps of recent messages
+        self._msg_times: deque = deque()
 
-    def send(self, header: dict, payload: bytes = b"") -> bool:
-        """Thread-safe send to this client's socket."""
-        with self._send_lock:
-            return send_frame(self.sock, header, payload)
+    async def send(self, header: dict, payload: bytes = b"") -> bool:
+        """Send a frame to this client. Returns False on error."""
+        ok = await send_frame(self.writer, header, payload)
+        if not ok:
+            self.alive = False
+        return ok
 
     def check_rate_limit(self, limit_per_minute: int) -> bool:
-        """Return True if the client is within the rate limit, False if exceeded."""
         now = time.monotonic()
-        # Purge timestamps older than 60 s
-        while self._last_msg_times and (now - self._last_msg_times[0]) > 60:
-            self._last_msg_times.popleft()
-        if len(self._last_msg_times) >= limit_per_minute:
+        while self._msg_times and (now - self._msg_times[0]) > 60:
+            self._msg_times.popleft()
+        if len(self._msg_times) >= limit_per_minute:
             return False
-        self._last_msg_times.append(now)
+        self._msg_times.append(now)
         return True
 
 
@@ -148,19 +170,19 @@ class ClientConn:
 
 class NoEyesServer:
     """
-    TCP chat server — rooms, rate limiting, heartbeat, message history.
+    Async TCP chat server — rooms, rate limiting, heartbeat, history.
 
-    BLIND FORWARDER: payload bytes are forwarded verbatim; the server
-    never calls any decryption function.
+    BLIND FORWARDER: payload bytes forwarded verbatim, never decrypted.
+    Single-threaded asyncio — zero CPU when idle, low heat, low battery.
     """
 
     def __init__(
         self,
-        host: str = "0.0.0.0",
-        port: int = 5000,
-        history_size: int = 50,
+        host:                 str = "0.0.0.0",
+        port:                 int = 5000,
+        history_size:         int = 50,
         rate_limit_per_minute: int = 30,
-        heartbeat_interval: int = 20,
+        heartbeat_interval:   int = 20,
     ):
         self.host               = host
         self.port               = port
@@ -168,87 +190,96 @@ class NoEyesServer:
         self.rate_limit         = rate_limit_per_minute
         self.heartbeat_interval = heartbeat_interval
 
-        # username → ClientConn (only online clients)
+        # username → ClientConn
         self._clients: dict[str, ClientConn] = {}
-        self._lock = threading.Lock()
-
-        # room → deque of (header, payload_bytes)
-        self._history: dict[str, deque] = defaultdict(lambda: deque(maxlen=history_size))
-
-        # username → vk_hex  (announcement-only, plaintext header value)
+        # room → deque[(header, payload)]
+        self._history: dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=history_size)
+        )
+        # username → vk_hex (Ed25519 verify key, plaintext header value)
         self._pubkeys: dict[str, str] = {}
 
     # ------------------------------------------------------------------
-    # Public API
+    # Entry point
     # ------------------------------------------------------------------
 
     def run(self) -> None:
-        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_sock.bind((self.host, self.port))
-        server_sock.listen(128)
-        logger.info("NoEyes server listening on %s:%d", self.host, self.port)
-        print(f"[server] Listening on {self.host}:{self.port}")
-
-        hb_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
-        hb_thread.start()
-
+        """Start the event loop. Blocks until Ctrl+C."""
         try:
-            while True:
-                sock, addr = server_sock.accept()
-                t = threading.Thread(
-                    target=self._handle_client,
-                    args=(sock, addr),
-                    daemon=True,
-                )
-                t.start()
+            asyncio.run(self._main())
         except KeyboardInterrupt:
             print("\n[server] Shutting down.")
-        finally:
-            server_sock.close()
+
+    async def _main(self) -> None:
+        server = await asyncio.start_server(
+            self._handle_client,
+            self.host,
+            self.port,
+            reuse_address=True,
+        )
+        async with server:
+            addrs = ", ".join(str(s.getsockname()) for s in server.sockets)
+            print(f"[server] Listening on {addrs}")
+            logger.info("NoEyes server listening on %s", addrs)
+            # Start heartbeat as a background task
+            asyncio.create_task(self._heartbeat_loop())
+            await server.serve_forever()
 
     # ------------------------------------------------------------------
-    # Per-client thread
+    # Per-client coroutine  (replaces the per-client thread)
     # ------------------------------------------------------------------
 
-    def _handle_client(self, sock: socket.socket, addr: tuple) -> None:
-        conn = ClientConn(sock, addr)
+    async def _handle_client(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        addr = writer.get_extra_info("peername")
+        conn = ClientConn(writer, addr)
         logger.debug("New connection from %s", addr)
 
         try:
-            # First frame must be a join event carrying username + room
-            result = recv_frame(sock)
+            # First frame must be a join event
+            result = await recv_frame(reader)
             if result is None:
                 return
             header, payload = result
 
             if header.get("type") != "system" or header.get("event") != "join":
-                logger.warning("First frame was not a join event from %s", addr)
+                logger.warning("First frame was not join from %s", addr)
                 return
 
             username = str(header.get("username", "")).strip()[:32]
             room     = str(header.get("room", "general")).strip()[:64]
+            vk_hex   = str(header.get("vk_hex", "")).strip()
 
             if not username:
                 return
 
-            # Ensure username is unique (append suffix if colliding)
-            with self._lock:
-                if username in self._clients:
-                    username = f"{username}_{addr[1]}"
-                conn.username = username
-                conn.room     = room
-                self._clients[username] = conn
+            # Reject duplicate username
+            if username in self._clients:
+                await send_frame(writer, {
+                    "type":    "system",
+                    "event":   "nick_error",
+                    "message": f"Username '{username}' is already taken.",
+                    "ts":      _now_ts(),
+                })
+                return
 
-            logger.info("%s joined room '%s' from %s", username, room, addr)
+            conn.username = username
+            conn.room     = room
+            conn.vk_hex   = vk_hex
+            self._clients[username] = conn
 
-            # Replay history to the new client
-            with self._lock:
-                history_snapshot = list(self._history[room])
+            if vk_hex:
+                self._pubkeys[username] = vk_hex
+
+            # Replay history to the new joiner
+            history_snapshot = list(self._history[room])
             for h, p in history_snapshot:
-                conn.send(h, p)
+                await conn.send(h, p)
 
-            # Broadcast join event to room (header only, empty payload — plaintext)
+            # Broadcast join event to room
             join_header = {
                 "type":     "system",
                 "event":    "join",
@@ -256,50 +287,64 @@ class NoEyesServer:
                 "room":     room,
                 "ts":       _now_ts(),
             }
-            self._broadcast_room(room, join_header, b"", exclude=username, record=False)
+            await self._broadcast_room(room, join_header, b"", exclude=username)
 
-            # Announce any known pubkeys in this room to the new joiner
-            self._send_known_pubkeys(conn, room)
+            # Send known pubkeys of room members to new joiner
+            await self._send_known_pubkeys(conn, room)
 
-            # Main receive loop
+            logger.info("%s joined room '%s'", username, room)
+
+            # Main receive loop — suspends cheaply between frames
             while conn.alive:
-                result = recv_frame(sock)
+                result = await recv_frame(reader)
                 if result is None:
                     break
                 h, p = result
-                self._dispatch(conn, h, p)
+                await self._dispatch(conn, h, p)
 
         except Exception as exc:
             logger.exception("Unhandled error for %s: %s", addr, exc)
         finally:
-            self._disconnect(conn)
+            await self._disconnect(conn)
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except OSError:
+                pass
 
-    def _dispatch(self, conn: ClientConn, header: dict, payload: bytes) -> None:
-        """Route an incoming frame based on its type header field."""
+    # ------------------------------------------------------------------
+    # Frame dispatcher
+    # ------------------------------------------------------------------
+
+    async def _dispatch(
+        self,
+        conn:    ClientConn,
+        header:  dict,
+        payload: bytes,
+    ) -> None:
         msg_type = header.get("type", "")
 
-        # --- Rate limiting (skip for heartbeats) ---
-        if msg_type not in ("heartbeat",):
+        # Rate limiting (skip heartbeats)
+        if msg_type != "heartbeat":
             if not conn.check_rate_limit(self.rate_limit):
-                warn = {"type": "system", "event": "rate_limit", "ts": _now_ts()}
-                conn.send( warn)
+                await conn.send({
+                    "type":  "system",
+                    "event": "rate_limit",
+                    "ts":    _now_ts(),
+                })
                 return
 
+        # Heartbeat ping — echo back
         if msg_type == "heartbeat":
-            # Echo heartbeat back; payload ignored (always empty)
-            conn.send( {"type": "heartbeat", "ts": _now_ts()})
+            await conn.send({"type": "heartbeat", "ts": _now_ts()})
             return
 
+        # Pubkey announcement — store and rebroadcast to room
         if msg_type == "pubkey_announce":
-            # Client is announcing its Ed25519 verify key.
-            # Store it (header-only) and broadcast to room so peers can TOFU it.
             vk_hex = str(header.get("vk_hex", "")).strip()
-            if vk_hex and len(vk_hex) == 64:  # 32 bytes → 64 hex chars
-                with self._lock:
-                    self._pubkeys[conn.username] = vk_hex
-                    conn.vk_hex = vk_hex
-                logger.debug("Stored pubkey for %s", conn.username)
-                # Re-broadcast the announcement (no payload — server keeps nothing secret)
+            if vk_hex:
+                self._pubkeys[conn.username] = vk_hex
+                conn.vk_hex = vk_hex
                 announce = {
                     "type":     "pubkey_announce",
                     "username": conn.username,
@@ -307,237 +352,215 @@ class NoEyesServer:
                     "room":     conn.room,
                     "ts":       _now_ts(),
                 }
-                self._broadcast_room(conn.room, announce, b"", exclude=conn.username, record=False)
+                await self._broadcast_room(
+                    conn.room, announce, b"", exclude=conn.username, record=False
+                )
             return
 
+        # DH handshake — route point-to-point, payload forwarded blind
         if msg_type in ("dh_init", "dh_resp"):
-            # DH handshake — route point-to-point to 'to' user.
-            # Payload is forwarded BLIND (encrypted with group key; server cannot read it).
-            to_user = header.get("to", "")
-            header["from"] = conn.username      # ensure 'from' is server-authoritative
+            to_user       = header.get("to", "")
+            header["from"] = conn.username
             header["ts"]   = _now_ts()
-            self._send_to_user(to_user, header, payload)
+            await self._send_to_user(to_user, header, payload)
             return
 
+        # Commands
         if msg_type == "command":
             event = header.get("event", "")
             if event == "users_req":
-                self._handle_users_req(conn)
-                return
-            if event == "nick":
-                self._handle_nick(conn, header)
-                return
-            if event == "join_room":
-                self._handle_join_room(conn, header)
-                return
-            # Unknown command — ignore
+                await self._handle_users_req(conn)
+            elif event == "nick":
+                await self._handle_nick(conn, header)
+            elif event == "join_room":
+                await self._handle_join_room(conn, header)
             return
 
+        # Chat (broadcast) and privmsg (point-to-point) — payload never decrypted
         if msg_type in ("chat", "privmsg"):
-            # For 'privmsg', 'to' header field is set; server routes point-to-point.
-            # For 'chat', server broadcasts to the room.
-            # In BOTH cases, the payload is forwarded verbatim — never decrypted.
-            header["from"] = conn.username    # server-authoritative sender field
+            header["from"] = conn.username
             header["ts"]   = _now_ts()
-
             if msg_type == "privmsg":
                 to_user = header.get("to", "")
-                self._send_to_user(to_user, header, payload)
+                await self._send_to_user(to_user, header, payload)
             else:
                 room = header.get("room", conn.room)
                 if room != conn.room:
-                    room = conn.room    # clients cannot broadcast to other rooms
-                self._broadcast_room(room, header, payload, exclude=None, record=True)
+                    room = conn.room   # cannot broadcast to other rooms
+                await self._broadcast_room(room, header, payload, record=True)
             return
 
-        if msg_type == "system":
-            # System events from client (e.g. leave) — broadcast header only.
-            event = header.get("event", "")
-            if event == "leave":
-                conn.alive = False  # triggers disconnect in caller
+        # Client-initiated leave
+        if msg_type == "system" and header.get("event") == "leave":
+            conn.alive = False
             return
 
-        logger.debug("Unknown frame type '%s' from %s — ignoring", msg_type, conn.username)
+        logger.debug("Unknown frame type '%s' from %s", msg_type, conn.username)
 
     # ------------------------------------------------------------------
-    # Routing helpers  (NO decryption — payload forwarded opaque)
+    # Routing helpers — NO decryption, payload forwarded opaque
     # ------------------------------------------------------------------
 
-    def _broadcast_room(
+    async def _broadcast_room(
         self,
-        room: str,
-        header: dict,
+        room:    str,
+        header:  dict,
         payload: bytes,
         *,
-        exclude: Optional[str],
-        record: bool,
+        exclude: Optional[str] = None,
+        record:  bool = False,
     ) -> None:
-        """Send a frame to all clients in *room*, optionally excluding one username."""
-        with self._lock:
-            targets = [
-                c for u, c in self._clients.items()
-                if c.room == room and u != exclude
-            ]
-            if record:
-                self._history[room].append((header, payload))
-
+        """Send a frame to every client in *room*, optionally skipping one."""
+        targets = [
+            c for u, c in self._clients.items()
+            if c.room == room and u != exclude
+        ]
+        if record:
+            self._history[room].append((header, payload))
         for client in targets:
-            client.send( header, payload)
+            await client.send(header, payload)
 
-    def _send_to_user(self, username: str, header: dict, payload: bytes) -> bool:
-        """Send a frame to a single user by username.  Returns False if not found."""
-        with self._lock:
-            conn = self._clients.get(username)
+    async def _send_to_user(
+        self,
+        username: str,
+        header:   dict,
+        payload:  bytes,
+    ) -> bool:
+        """Send a frame to a single user. Returns False if not found."""
+        conn = self._clients.get(username)
         if conn is None:
             return False
-        return conn.send( header, payload)
+        return await conn.send(header, payload)
 
-    def _send_known_pubkeys(self, new_conn: ClientConn, room: str) -> None:
-        """
-        When a client joins, send them the known pubkeys of all room members.
-        This lets them populate their TOFU store immediately.
-        """
-        with self._lock:
-            room_members = {
-                u: c.vk_hex
-                for u, c in self._clients.items()
-                if c.room == room and c.vk_hex and u != new_conn.username
-            }
-        for uname, vk_hex in room_members.items():
-            announce = {
-                "type":     "pubkey_announce",
-                "username": uname,
-                "vk_hex":   vk_hex,
-                "room":     room,
-                "ts":       _now_ts(),
-            }
-            new_conn.send( announce, b"")
+    async def _send_known_pubkeys(
+        self,
+        new_conn: ClientConn,
+        room:     str,
+    ) -> None:
+        """Send all known room-member pubkeys to a newly joined client."""
+        for uname, c in self._clients.items():
+            if c.room == room and c.vk_hex and uname != new_conn.username:
+                await new_conn.send({
+                    "type":     "pubkey_announce",
+                    "username": uname,
+                    "vk_hex":   c.vk_hex,
+                    "room":     room,
+                    "ts":       _now_ts(),
+                }, b"")
 
     # ------------------------------------------------------------------
     # Command handlers
     # ------------------------------------------------------------------
 
-    def _handle_users_req(self, conn: ClientConn) -> None:
-        """Reply with a list of users in the same room — plaintext header, no payload."""
-        with self._lock:
-            users = [u for u, c in self._clients.items() if c.room == conn.room]
-        resp = {
+    async def _handle_users_req(self, conn: ClientConn) -> None:
+        users = [u for u, c in self._clients.items() if c.room == conn.room]
+        await conn.send({
             "type":  "command",
             "event": "users_resp",
             "users": users,
             "room":  conn.room,
             "ts":    _now_ts(),
-        }
-        conn.send( resp)
+        })
 
-    def _handle_nick(self, conn: ClientConn, header: dict) -> None:
-        """Rename a user.  Broadcasts a system event to the room."""
+    async def _handle_nick(self, conn: ClientConn, header: dict) -> None:
         new_nick = str(header.get("nick", "")).strip()[:32]
         if not new_nick:
             return
         old_nick = conn.username
 
-        with self._lock:
-            if new_nick in self._clients:
-                # Collision — reject
-                conn.send( {
-                    "type":    "system",
-                    "event":   "nick_error",
-                    "message": f"Username '{new_nick}' is already taken.",
-                    "ts":      _now_ts(),
-                })
-                return
-            del self._clients[old_nick]
-            conn.username = new_nick
-            self._clients[new_nick] = conn
-            # Update pubkey map
-            if old_nick in self._pubkeys:
-                self._pubkeys[new_nick] = self._pubkeys.pop(old_nick)
+        if new_nick in self._clients:
+            await conn.send({
+                "type":    "system",
+                "event":   "nick_error",
+                "message": f"Username '{new_nick}' is already taken.",
+                "ts":      _now_ts(),
+            })
+            return
 
-        nick_event = {
+        del self._clients[old_nick]
+        conn.username = new_nick
+        self._clients[new_nick] = conn
+        if old_nick in self._pubkeys:
+            self._pubkeys[new_nick] = self._pubkeys.pop(old_nick)
+
+        await self._broadcast_room(conn.room, {
             "type":     "system",
             "event":    "nick",
             "old_nick": old_nick,
             "new_nick": new_nick,
             "room":     conn.room,
             "ts":       _now_ts(),
-        }
-        self._broadcast_room(conn.room, nick_event, b"", exclude=None, record=False)
+        }, b"")
 
-    def _handle_join_room(self, conn: ClientConn, header: dict) -> None:
-        """Move a client to a new room."""
+    async def _handle_join_room(self, conn: ClientConn, header: dict) -> None:
         new_room = str(header.get("room", "general")).strip()[:64]
         old_room = conn.room
 
-        # Leave old room — reason:"room_change" tells clients NOT to wipe pairwise keys
-        leave_event = {
+        # Notify old room — reason:"room_change" so clients keep pairwise keys
+        await self._broadcast_room(old_room, {
             "type":     "system",
             "event":    "leave",
             "username": conn.username,
             "room":     old_room,
             "reason":   "room_change",
             "ts":       _now_ts(),
-        }
-        self._broadcast_room(old_room, leave_event, b"", exclude=conn.username, record=False)
+        }, b"", exclude=conn.username)
 
-        with self._lock:
-            conn.room = new_room
+        conn.room = new_room
 
-        # Join new room
-        join_event = {
+        # Notify new room
+        await self._broadcast_room(new_room, {
             "type":     "system",
             "event":    "join",
             "username": conn.username,
             "room":     new_room,
             "ts":       _now_ts(),
-        }
-        self._broadcast_room(new_room, join_event, b"", exclude=conn.username, record=False)
-        # Replay history
-        with self._lock:
-            history_snapshot = list(self._history[new_room])
-        for h, p in history_snapshot:
-            conn.send( h, p)
+        }, b"", exclude=conn.username)
+
+        # Replay history to the joining client
+        for h, p in list(self._history[new_room]):
+            await conn.send(h, p)
 
     # ------------------------------------------------------------------
     # Disconnect / cleanup
     # ------------------------------------------------------------------
 
-    def _disconnect(self, conn: ClientConn) -> None:
-        with self._lock:
-            self._clients.pop(conn.username, None)
+    async def _disconnect(self, conn: ClientConn) -> None:
+        if not conn.username:
+            return
+        self._clients.pop(conn.username, None)
         conn.alive = False
-        try:
-            conn.sock.close()
-        except OSError:
-            pass
         logger.info("%s disconnected", conn.username)
 
-        leave_event = {
+        # Notify room of real disconnect (no "reason" field → client clears pairwise)
+        await self._broadcast_room(conn.room, {
             "type":     "system",
             "event":    "leave",
             "username": conn.username,
             "room":     conn.room,
             "ts":       _now_ts(),
-        }
-        self._broadcast_room(conn.room, leave_event, b"", exclude=conn.username, record=False)
+        }, b"", exclude=conn.username)
 
     # ------------------------------------------------------------------
-    # Heartbeat loop
+    # Heartbeat — asyncio.sleep is true idle, zero CPU
     # ------------------------------------------------------------------
 
-    def _heartbeat_loop(self) -> None:
+    async def _heartbeat_loop(self) -> None:
         while True:
-            time.sleep(self.heartbeat_interval)
-            with self._lock:
-                all_conns = list(self._clients.values())
-            for conn in all_conns:
-                if not conn.send( {"type": "heartbeat", "ts": _now_ts()}):
-                    conn.alive = False
+            await asyncio.sleep(self.heartbeat_interval)
+            dead = []
+            for username, conn in list(self._clients.items()):
+                ok = await conn.send({"type": "heartbeat", "ts": _now_ts()})
+                if not ok:
+                    dead.append(conn)
+            for conn in dead:
+                await self._disconnect(conn)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _now_ts() -> str:
     return time.strftime("%H:%M:%S")
