@@ -150,12 +150,24 @@ _ERASE_EOL   = "\033[K"
 _ANIM_LOCK = threading.Lock()
 
 
+def _strip_ansi(s: str) -> str:
+    """Strip ANSI escape codes to get the printable-only string."""
+    return re.sub(r"\033\[[0-9;]*m", "", s)
+
+
 def _run_animation(prefix: str, plaintext: str) -> None:
     """
     Core two-phase animation.  Called with _ANIM_LOCK already held.
 
     prefix    — formatted '[ts] user: ' string (may contain ANSI codes)
     plaintext — decrypted message text
+
+    Wrap-safe design
+    ────────────────
+    Phase 1 (cipher) is capped so it NEVER wraps past the terminal edge.
+    Phase 2 (reveal) uses \r + \033[2K to nuke the cipher line cleanly,
+    then retypes the prefix + plaintext — wrapping is fine here because
+    we are no longer trying to overwrite anything.
     """
     n = len(plaintext)
     if n == 0:
@@ -163,13 +175,20 @@ def _run_animation(prefix: str, plaintext: str) -> None:
         sys.stdout.flush()
         return
 
-    # ── Phase 1: cipher noise, exactly n chars ───────────────────────────────
-    # Print prefix then save cursor position so Phase 2 can rewind even if
-    # the cipher chars caused the line to wrap.
-    sys.stdout.write(prefix + _CUR_SAVE)
+    # How many cipher chars can fit on the same line as the prefix?
+    try:
+        term_width = os.get_terminal_size().columns
+    except OSError:
+        term_width = 80
+    prefix_vis  = len(_strip_ansi(prefix))          # printable width of prefix
+    cipher_slots = max(4, term_width - prefix_vis - 1)   # at least 4 chars
+    cipher_n     = min(n, cipher_slots)              # never more than plaintext len
+
+    # ── Phase 1: cipher noise, guaranteed to stay on one line ────────────────
+    sys.stdout.write(prefix)
     sys.stdout.flush()
 
-    for _ in range(n):
+    for _ in range(cipher_n):
         ch    = random.choice(_CIPHER_POOL)
         color = random.choice(_CIPHER_COLORS)
         sys.stdout.write(color + ch + RESET)
@@ -178,26 +197,27 @@ def _run_animation(prefix: str, plaintext: str) -> None:
 
     time.sleep(_REVEAL_PAUSE)
 
-    # ── Phase 2: restore cursor, type plaintext with lock-in flash ───────────
-    sys.stdout.write(_CUR_RESTORE)
+    # ── Phase 2: erase the whole line, retype prefix, reveal plaintext ───────
+    # \r  → go to column 0
+    # \033[2K → erase the entire current line (no leftover cipher chars)
+    # Then retype prefix so columns line up exactly as before.
+    sys.stdout.write("\r\033[2K" + prefix)
     sys.stdout.flush()
 
     per_char   = min(_PLAIN_CHAR_MAX, _PLAIN_TOTAL_CAP / n)
     settle_dur = max(0.0, per_char - _FLASH_DUR)
 
     for ch in plaintext:
-        # Char appears bright-white ("locks in")
+        # Flash bright-white (lock-in feel)
         sys.stdout.write(BRIGHT_WHITE + ch + RESET)
         sys.stdout.flush()
         time.sleep(_FLASH_DUR)
-
-        # Step back one column and rewrite in normal colour (settles)
+        # Step back one column, rewrite in normal colour (settles)
         sys.stdout.write(_CUR_BACK1 + ch)
         sys.stdout.flush()
         time.sleep(settle_dur)
 
-    # Erase any residual cipher chars (guards emoji/wide-char edge cases)
-    sys.stdout.write(_ERASE_EOL + "\n")
+    sys.stdout.write("\n")
     sys.stdout.flush()
 
 
