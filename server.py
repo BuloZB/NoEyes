@@ -483,14 +483,23 @@ class NoEyesServer:
         if old_nick in self._pubkeys:
             self._pubkeys[new_nick] = self._pubkeys.pop(old_nick)
 
-        await self._broadcast_room(conn.room, {
+        # Broadcast nick change to ALL rooms, not just the current one.
+        # If we only broadcast to conn.room, clients in other rooms keep sending
+        # /msg to the old name, which the server can no longer route — silent drop.
+        nick_event = {
             "type":     "system",
             "event":    "nick",
             "old_nick": old_nick,
             "new_nick": new_nick,
             "room":     conn.room,
             "ts":       _now_ts(),
-        }, b"")
+        }
+        seen = set()
+        for uname, c in list(self._clients.items()):
+            if c.room not in seen and uname != new_nick:
+                seen.add(c.room)
+        for room in seen:
+            await self._broadcast_room(room, nick_event, b"", exclude=new_nick)
 
     async def _handle_join_room(self, conn: ClientConn, header: dict) -> None:
         new_room = str(header.get("room", "general")).strip()[:64]

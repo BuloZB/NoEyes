@@ -249,6 +249,9 @@ def run_tests() -> None:
         else:
             print("[FAIL] Test 8 - /msg failed after peer nick change.")
             failures.append("msg broken after nick change")
+        # Restore bob back to original name so subsequent tests using BOB constant work
+        bob_proc.stdin.write(b"/nick bob\n"); bob_proc.stdin.flush()
+        time.sleep(0.6)
 
         # ---- Test 9: simultaneous /msg both ways (Bug 3 fix) ----
         print("[selftest] Testing simultaneous /msg from both sides...")
@@ -274,6 +277,160 @@ def run_tests() -> None:
         else:
             print("[FAIL] Test 9 - Simultaneous DH failed (alice->carol: %s, carol->alice: %s)." % (a_ok, c_ok))
             failures.append("simultaneous DH initiation")
+
+        # ---- Test 10: Reverse /msg bob→alice after established DH ----
+        print("[selftest] Test 10: reverse /msg bob->alice...")
+        REV_MSG = "reverse_msg_bob_to_alice"
+        # bob already has pairwise key with alice from earlier tests; send back
+        bob_proc.stdin.write(("/msg " + ALICE + " " + REV_MSG + "\n").encode())
+        bob_proc.stdin.flush()
+        if alice_reader.wait_for(REV_MSG, timeout=8):
+            print("[PASS] Test 10 - Reverse /msg bob->alice delivered.")
+        else:
+            print("[FAIL] Test 10 - Reverse /msg bob->alice failed.")
+            failures.append("reverse msg bob->alice")
+
+        # ---- Test 11: /msg after RECIPIENT switches room ----
+        print("[selftest] Test 11: /msg after recipient switches room...")
+        RECIP_ROOM_MSG = "msg_after_recipient_room_switch"
+        bob_proc.stdin.write(b"/join otherroom\n"); bob_proc.stdin.flush()
+        time.sleep(0.8)
+        alice_proc.stdin.write(("/msg " + BOB + " " + RECIP_ROOM_MSG + "\n").encode())
+        alice_proc.stdin.flush()
+        if bob_reader.wait_for(RECIP_ROOM_MSG, timeout=8):
+            print("[PASS] Test 11 - /msg works after recipient switches room.")
+        else:
+            print("[FAIL] Test 11 - /msg failed after recipient switched room.")
+            failures.append("msg broken after recipient room switch")
+        # Restore bob to general
+        bob_proc.stdin.write(b"/join general\n"); bob_proc.stdin.flush()
+        time.sleep(0.5)
+
+        # ---- Test 12: /msg after SENDER renames (/nick then /msg) ----
+        print("[selftest] Test 12: /msg after sender renames...")
+        SENDER_NICK_MSG = "msg_after_sender_rename"
+        alice_proc.stdin.write(b"/nick alicerenamed\n"); alice_proc.stdin.flush()
+        time.sleep(0.8)
+        # alice (now "alicerenamed") sends to bob — bob should have migrated key via nick event
+        alice_proc.stdin.write(("/msg " + BOB + " " + SENDER_NICK_MSG + "\n").encode())
+        alice_proc.stdin.flush()
+        if bob_reader.wait_for(SENDER_NICK_MSG, timeout=10):
+            print("[PASS] Test 12 - /msg works after sender renames.")
+        else:
+            print("[FAIL] Test 12 - /msg failed after sender renamed.")
+            failures.append("msg broken after sender rename")
+        # Restore alice's name
+        alice_proc.stdin.write(b"/nick alice\n"); alice_proc.stdin.flush()
+        time.sleep(0.5)
+
+        # ---- Test 13: Multiple messages queued before DH completes ----
+        print("[selftest] Test 13: multiple queued messages before DH...")
+        # Use dave (fresh user) so no pre-existing pairwise key
+        dave_proc = _start([
+            "noeyes.py", "--connect", "127.0.0.1",
+            "--port", str(TEST_PORT),
+            "--username", "dave",
+            "--key-file", keyfile.name,
+        ], stdin=True)
+        procs.append(dave_proc)
+        dave_reader = _OutputReader(dave_proc)
+        time.sleep(1.0)
+        QUEUE_MSGS = ["queued_one", "queued_two", "queued_three"]
+        # Send 3 msgs in rapid succession before DH can complete
+        for m in QUEUE_MSGS:
+            alice_proc.stdin.write(("/msg dave " + m + "\n").encode())
+            alice_proc.stdin.flush()
+        all_delivered = all(dave_reader.wait_for(m, timeout=12) for m in QUEUE_MSGS)
+        if all_delivered:
+            print("[PASS] Test 13 - All 3 queued messages delivered after DH.")
+        else:
+            missing = [m for m in QUEUE_MSGS if m not in dave_reader._buf]
+            print("[FAIL] Test 13 - Missing queued messages: %s" % missing)
+            failures.append("queued messages lost")
+
+        # ---- Test 14: Cross-room nick change — /msg to renamed user ----
+        print("[selftest] Test 14: cross-room nick change visibility...")
+        CROSS_NICK_MSG = "cross_room_nick_msg"
+        # Put eve in a separate room from alice so nick broadcast was previously invisible
+        eve_proc = _start([
+            "noeyes.py", "--connect", "127.0.0.1",
+            "--port", str(TEST_PORT),
+            "--username", "eve",
+            "--key-file", keyfile.name,
+        ], stdin=True)
+        procs.append(eve_proc)
+        eve_reader = _OutputReader(eve_proc)
+        time.sleep(1.0)
+        # Establish DH between alice and eve first
+        alice_proc.stdin.write(b"/msg eve warmup\n"); alice_proc.stdin.flush()
+        eve_proc.stdin.write(b"/msg alice warmup_back\n"); eve_proc.stdin.flush()
+        time.sleep(2.0)
+        # Now move eve to a different room
+        eve_proc.stdin.write(b"/join everoom\n"); eve_proc.stdin.flush()
+        time.sleep(0.8)
+        # Alice renames while eve is in a different room
+        alice_proc.stdin.write(b"/nick alicefinal\n"); alice_proc.stdin.flush()
+        time.sleep(0.8)
+        # Eve (cross-room) should have received the nick event and updated routing
+        # Eve now sends /msg alicefinal — with Bug 4 fixed, alice gets it
+        eve_proc.stdin.write(("/msg alicefinal " + CROSS_NICK_MSG + "\n").encode())
+        eve_proc.stdin.flush()
+        if alice_reader.wait_for(CROSS_NICK_MSG, timeout=10):
+            print("[PASS] Test 14 - Cross-room nick change propagated; /msg delivered.")
+        else:
+            print("[FAIL] Test 14 - Cross-room nick change NOT propagated; /msg silently dropped.")
+            failures.append("cross-room nick change invisible")
+        # Restore alice's name for any further tests
+        alice_proc.stdin.write(b"/nick alice\n"); alice_proc.stdin.flush()
+        eve_proc.stdin.write(b"/join general\n"); eve_proc.stdin.flush()
+        time.sleep(0.5)
+
+        # ---- Test 15: /msg to self — must fail gracefully, no hang ----
+        print("[selftest] Test 15: /msg to self graceful rejection...")
+        alice_proc.stdin.write(b"/msg alice this_should_not_send\n"); alice_proc.stdin.flush()
+        # Expect a warning line, NOT an infinite loop — just check it doesn't crash
+        # and that no dh_init is stuck (we check bob doesn't receive anything weird)
+        time.sleep(1.0)
+        # If alice didn't crash, test passes (no way to easily detect the warning line
+        # from the outside, but alice should still be alive and responsive)
+        alice_proc.stdin.write(("/msg " + BOB + " selftest_alive_check\n").encode())
+        alice_proc.stdin.flush()
+        if bob_reader.wait_for("selftest_alive_check", timeout=8):
+            print("[PASS] Test 15 - /msg to self rejected gracefully; client still alive.")
+        else:
+            print("[FAIL] Test 15 - Client crashed or hung after /msg to self.")
+            failures.append("msg to self crash or hang")
+
+        # ---- Test 16: Disconnect and reconnect — re-establish DH ----
+        print("[selftest] Test 16: reconnect and re-establish DH...")
+        RECON_MSG = "msg_after_reconnect"
+        # Kill bob, restart him
+        try:
+            bob_proc.stdin.write(b"/quit\n"); bob_proc.stdin.flush()
+        except OSError:
+            pass
+        bob_proc.terminate()
+        bob_proc.wait(timeout=3)
+        procs.remove(bob_proc)
+        time.sleep(1.0)
+        # Restart bob — alice should clear his pairwise key on disconnect event
+        bob_proc2 = _start([
+            "noeyes.py", "--connect", "127.0.0.1",
+            "--port", str(TEST_PORT),
+            "--username", BOB,
+            "--key-file", keyfile.name,
+        ], stdin=True)
+        procs.append(bob_proc2)
+        bob_reader2 = _OutputReader(bob_proc2)
+        time.sleep(1.5)
+        # Now alice sends /msg — should trigger fresh DH (old key was cleared on disconnect)
+        alice_proc.stdin.write(("/msg " + BOB + " " + RECON_MSG + "\n").encode())
+        alice_proc.stdin.flush()
+        if bob_reader2.wait_for(RECON_MSG, timeout=10):
+            print("[PASS] Test 16 - DH re-established after reconnect; message delivered.")
+        else:
+            print("[FAIL] Test 16 - /msg failed after reconnect.")
+            failures.append("msg after reconnect")
 
     finally:
         # ---- Teardown ----
@@ -302,7 +459,7 @@ def run_tests() -> None:
         print(f"[FAIL] {len(failures)} check(s) FAILED: {', '.join(failures)}")
         sys.exit(1)
     else:
-        print("[PASS] All 9 acceptance checks passed.")
+        print("[PASS] All 16 acceptance checks passed.")
 
 
 if __name__ == "__main__":

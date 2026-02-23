@@ -908,6 +908,9 @@ class NoEyesClient:
         if cmd == "/msg" and len(parts) >= 3:
             peer = parts[1]
             text = parts[2]
+            if peer == self.username:
+                print(utils.cwarn("[msg] Cannot send a private message to yourself."))
+                return
             if peer in self._pairwise:
                 self._send_privmsg_encrypted(peer, text)
             else:
