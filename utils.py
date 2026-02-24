@@ -150,17 +150,16 @@ def _strip_ansi(s: str) -> str:
 
 def _run_animation(prefix: str, plaintext: str) -> None:
     """
-    Core two-phase animation.  Called with _ANIM_LOCK already held.
+    Two-phase cinematic decrypt animation.
 
-    Wrap-proof design
-    ─────────────────
-    Phase 1: print cipher chars.  We track EXACTLY how many terminal rows
-    they occupy using the live terminal width.  Any zoom level is fine.
+    Phase 1 — cipher: n random chars stream out in cyan at _CIPHER_CHAR_DELAY
+               each.  No line cap — let them wrap naturally.
 
-    Phase 2: move the cursor back up to row 0 of the cipher block, go to
-    column 0, then \033[J (erase from cursor to end of screen) nukes every
-    cipher row in one shot — no matter how many lines wrapped.  Then we
-    retype prefix + plaintext from scratch.
+    Phase 2 — reveal: cursor moves back to the start of the cipher block
+               (using the exact lines_up formula), reprints the prefix to
+               overwrite it, then for each position flickers 3 random chars
+               (using \033[1D to stay in place) before landing the real char.
+               No erase escape used — everything is direct overwrite.
     """
     n = len(plaintext)
     if n == 0:
@@ -175,36 +174,47 @@ def _run_animation(prefix: str, plaintext: str) -> None:
 
     prefix_vis = len(_strip_ansi(prefix))
 
-    # Cipher chars must fit on the same line as the prefix — never wrap.
-    cipher_n = min(n, max(4, term_width - prefix_vis - 1))
-
-    # ── Phase 1: print prefix once, then stream cipher chars ─────────────────
+    # ── Phase 1: full-length cipher stream ───────────────────────────────────
     sys.stdout.write(prefix)
     sys.stdout.flush()
 
-    for _ in range(cipher_n):
+    for _ in range(n):
         sys.stdout.write(random.choice(_CIPHER_COLORS) + random.choice(_CIPHER_POOL) + RESET)
         sys.stdout.flush()
         time.sleep(_CIPHER_CHAR_DELAY)
 
     time.sleep(_REVEAL_PAUSE)
 
-    # ── Phase 2: \r back to line start, reprint prefix, type plaintext ───────
-    # The prefix overwrites itself (same bytes, same width).
-    # Each plaintext char overwrites the cipher char that was in that column.
-    # NO line-erase escape — that's what caused the flash/disappear.
-    sys.stdout.write("\r" + prefix)
+    # ── Move cursor back to start of cipher block ────────────────────────────
+    # After writing prefix_vis + n chars from col 0, cursor row =
+    # (prefix_vis + n) // term_width  (integer division, no rounding needed).
+    lines_up = (prefix_vis + n) // term_width
+    if lines_up:
+        sys.stdout.write(f"\033[{lines_up}A")   # move up
+    sys.stdout.write("\r" + prefix)              # col 0, overwrite prefix
     sys.stdout.flush()
 
-    per_char = min(_PLAIN_CHAR_MAX, _PLAIN_TOTAL_CAP / n)
+    # ── Phase 2: flicker-reveal each char ────────────────────────────────────
+    # Per-char budget: start slow (dramatic), speed up as message resolves.
+    per_char    = min(_PLAIN_CHAR_MAX, _PLAIN_TOTAL_CAP / n)
+    flicker_dur = min(0.025, per_char / 4)
+    settle_dur  = max(0.008, per_char - 3 * flicker_dur)
+
     for ch in plaintext:
+        # 3 flicker cycles: write a random cipher char then step back 1 col
+        for _ in range(3):
+            sys.stdout.write(
+                random.choice(_CIPHER_COLORS) + random.choice(_CIPHER_POOL) + RESET
+                + "\033[1D"
+            )
+            sys.stdout.flush()
+            time.sleep(flicker_dur)
+        # Land the real character
         sys.stdout.write(ch)
         sys.stdout.flush()
-        time.sleep(per_char)
+        time.sleep(settle_dur)
 
-    # Erase any leftover cipher chars to the right of the cursor
-    # (happens when plaintext is shorter than cipher_n)
-    sys.stdout.write("\033[K\n")
+    sys.stdout.write("\n")
     sys.stdout.flush()
 
 
