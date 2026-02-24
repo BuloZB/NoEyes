@@ -209,7 +209,7 @@ class NoEyesClient:
             self.sock = s
             return True
         except OSError as e:
-            print(utils.cerr(f"[error] Cannot connect to {self.host}:{self.port} — {e}"))
+            utils.print_msg(utils.cerr(f"[error] Cannot connect to {self.host}:{self.port} — {e}"))
             return False
 
     def _send(self, header: dict, payload: bytes = b"") -> bool:
@@ -233,7 +233,7 @@ class NoEyesClient:
             if not self.connect():
                 if not self.reconnect or self._quit:
                     return
-                print(utils.cwarn(f"[reconnect] Retrying in {backoff}s…"))
+                utils.print_msg(utils.cwarn(f"[reconnect] Retrying in {backoff}s…"))
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 60)
                 continue
@@ -279,7 +279,7 @@ class NoEyesClient:
                     self.sock.close()
                 except OSError:
                     pass
-                print(utils.cinfo("\n[bye] Disconnected."))
+                utils.print_msg(utils.cinfo("\n[bye] Disconnected."))
                 return
 
             # If the session lasted less than 5 seconds it was a bad connection,
@@ -288,7 +288,7 @@ class NoEyesClient:
             if session_duration < 5.0:
                 backoff = min(backoff * 2, 60)
 
-            print(utils.cwarn(f"[reconnect] Connection lost. Reconnecting in {backoff}s…"))
+            utils.print_msg(utils.cwarn(f"[reconnect] Connection lost. Reconnecting in {backoff}s…"))
             try:
                 self.sock.close()
             except OSError:
@@ -322,7 +322,7 @@ class NoEyesClient:
             try:
                 self._handle_frame(header, payload)
             except Exception as exc:
-                print(utils.cerr(f"[error] Frame handling error: {exc}"))
+                utils.print_msg(utils.cerr(f"[error] Frame handling error: {exc}"))
 
     def _handle_frame(self, header: dict, payload: bytes) -> None:
         msg_type = header.get("type", "")
@@ -379,9 +379,9 @@ class NoEyesClient:
             self.tofu_store, uname, vk_hex, self.tofu_path
         )
         if is_new:
-            print(utils.cok(f"[tofu] Trusted new key for {uname} (first contact)."))
+            utils.print_msg(utils.cok(f"[tofu] Trusted new key for {uname} (first contact)."))
         elif not trusted:
-            print(utils.cerr(
+            utils.print_msg(utils.cerr(
                 f"[SECURITY WARNING] Key mismatch for {uname}! "
                 "Possible impersonation — check with peer out-of-band. "
                 "Private messages from this user will NOT be displayed."
@@ -415,7 +415,7 @@ class NoEyesClient:
             age = time.monotonic() - self._dh_pending[peer]["ts"]
             if age < self._DH_TIMEOUT:
                 return  # genuinely in flight, keep waiting
-            print(utils.cwarn(f"[dh] Key exchange with {peer} timed out — retrying…"))
+            utils.print_msg(utils.cwarn(f"[dh] Key exchange with {peer} timed out — retrying…"))
             del self._dh_pending[peer]
 
         priv_bytes, pub_bytes = enc.dh_generate_keypair()
@@ -435,7 +435,7 @@ class NoEyesClient:
             "from": self.username,
         }
         self._send(header, encrypted_payload)
-        print(utils.cgrey(f"[dh] Initiating key exchange with {peer}…"))
+        utils.print_msg(utils.cgrey(f"[dh] Initiating key exchange with {peer}…"))
 
     def _handle_dh_init(self, header: dict, payload: bytes) -> None:
         """Respond to a dh_init from *from_user* with our DH public key."""
@@ -449,7 +449,7 @@ class NoEyesClient:
             inner = json.loads(inner_bytes)
             peer_dh_pub = bytes.fromhex(inner["dh_pub"])
         except (InvalidToken, KeyError, ValueError):
-            print(utils.cwarn(f"[dh] Could not decrypt dh_init from {from_user}"))
+            utils.print_msg(utils.cwarn(f"[dh] Could not decrypt dh_init from {from_user}"))
             return
 
         # Bug fix: simultaneous DH initiation tiebreaker.
@@ -476,7 +476,7 @@ class NoEyesClient:
         # Derive pairwise Fernet immediately
         pairwise = enc.dh_derive_shared_fernet(priv_bytes, peer_dh_pub)
         self._pairwise[from_user] = pairwise
-        print(utils.cok(f"[dh] Pairwise key established with {from_user}."))
+        utils.print_msg(utils.cok(f"[dh] Pairwise key established with {from_user}."))
 
         # Send dh_resp
         resp_inner = json.dumps({"dh_pub": pub_bytes.hex()}).encode()
@@ -509,13 +509,13 @@ class NoEyesClient:
             inner = json.loads(inner_bytes)
             peer_dh_pub = bytes.fromhex(inner["dh_pub"])
         except (InvalidToken, KeyError, ValueError):
-            print(utils.cwarn(f"[dh] Could not decrypt dh_resp from {from_user}"))
+            utils.print_msg(utils.cwarn(f"[dh] Could not decrypt dh_resp from {from_user}"))
             return
 
         priv_bytes = self._dh_pending.pop(from_user)["priv"]
         pairwise = enc.dh_derive_shared_fernet(priv_bytes, peer_dh_pub)
         self._pairwise[from_user] = pairwise
-        print(utils.cok(f"[dh] Pairwise key established with {from_user}."))
+        utils.print_msg(utils.cok(f"[dh] Pairwise key established with {from_user}."))
 
         # Flush any queued outgoing messages
         for text in self._msg_queue.pop(from_user, []):
@@ -543,13 +543,13 @@ class NoEyesClient:
         }
         self._send(header, payload)
         ts = time.strftime("%H:%M:%S")
-        print(utils.format_own_message(self.username, text, ts))
+        utils.print_msg(utils.format_own_message(self.username, text, ts))
 
     def _send_privmsg_encrypted(self, peer: str, text: str) -> None:
         """Send a /msg to *peer* using the established pairwise Fernet."""
         pairwise = self._pairwise.get(peer)
         if pairwise is None:
-            print(utils.cwarn(f"[msg] No pairwise key for {peer} — queuing after DH."))
+            utils.print_msg(utils.cwarn(f"[msg] No pairwise key for {peer} — queuing after DH."))
             self._ensure_dh(peer, then_send=(text,))
             return
 
@@ -570,7 +570,7 @@ class NoEyesClient:
             "from": self.username,
         }
         self._send( header, payload)
-        print(utils.format_privmsg(f"you → {peer}", text, ts, verified=True))
+        utils.print_msg(utils.format_privmsg(f"you → {peer}", text, ts, verified=True))
 
     def _handle_chat(self, header: dict, payload: bytes, ts: str) -> None:
         """Decrypt and display a group chat message."""
@@ -582,7 +582,7 @@ class NoEyesClient:
             text = body.get("text", "")
             msg_ts = body.get("ts", ts)
         except (InvalidToken, json.JSONDecodeError):
-            print(utils.cwarn(
+            utils.print_msg(utils.cwarn(
                 f"[warn] Could not decrypt group message from {from_user}. "
                 "Wrong key?"
             ))
@@ -609,7 +609,7 @@ class NoEyesClient:
         try:
             body = json.loads(pairwise.decrypt(payload))
         except (InvalidToken, json.JSONDecodeError):
-            print(utils.cwarn(f"[msg] Could not decrypt message from {from_user}."))
+            utils.print_msg(utils.cwarn(f"[msg] Could not decrypt message from {from_user}."))
             return
 
         subtype = header.get("subtype", "text")
@@ -637,7 +637,7 @@ class NoEyesClient:
                     pass
 
             if not verified and vk_hex:
-                print(utils.cwarn(
+                utils.print_msg(utils.cwarn(
                     f"[SECURITY] Signature FAILED for message from {from_user} — displaying anyway."
                 ))
 
@@ -676,7 +676,7 @@ class NoEyesClient:
             "next_index":   0,
             "pending":      {},   # out-of-order chunks held briefly
         }
-        print(utils.cinfo(
+        utils.print_msg(utils.cinfo(
             f"[recv] Incoming '{filename}' from {from_user} "
             f"({_human_size(size)}, {total} chunk(s))…"
         ))
@@ -711,7 +711,7 @@ class NoEyesClient:
         try:
             raw = enc.gcm_decrypt(gcm_key, gcm_blob)
         except Exception:
-            print(utils.cwarn(f"[recv] GCM auth failed on chunk {index} from {from_user}"))
+            utils.print_msg(utils.cwarn(f"[recv] GCM auth failed on chunk {index} from {from_user}"))
             return
 
         meta["pending"][index] = raw
@@ -748,7 +748,7 @@ class NoEyesClient:
         tid     = body.get("transfer_id", "")
         sig_hex = body.get("sig_hex", "")
         if tid not in self._incoming_files:
-            print(utils.cwarn(f"[recv] Got file_end for unknown transfer {tid}"))
+            utils.print_msg(utils.cwarn(f"[recv] Got file_end for unknown transfer {tid}"))
             return
 
         meta = self._incoming_files.pop(tid)
@@ -756,7 +756,7 @@ class NoEyesClient:
         meta["tmp_file"].close()
 
         if meta["received"] != meta["total_chunks"]:
-            print(utils.cwarn(
+            utils.print_msg(utils.cwarn(
                 f"[recv] '{meta['filename']}' incomplete "
                 f"({meta['received']}/{meta['total_chunks']} chunks) — discarded."
             ))
@@ -777,7 +777,7 @@ class NoEyesClient:
                 pass
 
         if not verified and vk_hex:
-            print(utils.cwarn(
+            utils.print_msg(utils.cwarn(
                 f"[SECURITY] File signature FAILED from {from_user} — saving anyway."
             ))
 
@@ -785,7 +785,7 @@ class NoEyesClient:
         dest = _unique_dest(meta["filename"])
         import shutil as _sh
         _sh.move(meta["tmp_path"], dest)
-        print(utils.cok(
+        utils.print_msg(utils.cok(
             f"[recv] ✓ '{meta['filename']}' from {from_user} saved to {dest} "
             f"({_human_size(meta['total_size'])})"
             f"{' ✓ verified' if verified else ''}"
@@ -795,23 +795,23 @@ class NoEyesClient:
         event = header.get("event", "")
         if event == "join":
             uname = header.get("username", "?")
-            print(utils.format_system(f"{uname} has joined the chat.", ts))
+            utils.print_msg(utils.format_system(f"{uname} has joined the chat.", ts))
         elif event == "leave":
             uname  = header.get("username", "?")
             reason = header.get("reason", "disconnect")
             if reason == "room_change":
-                print(utils.format_system(f"{uname} switched rooms.", ts))
+                utils.print_msg(utils.format_system(f"{uname} switched rooms.", ts))
                 # Pairwise key is preserved — they're still online, just in another room.
                 # /msg and /send will still work across rooms.
             else:
-                print(utils.format_system(f"{uname} has left the chat.", ts))
+                utils.print_msg(utils.format_system(f"{uname} has left the chat.", ts))
                 # Real disconnect — clear pairwise state so stale keys don't accumulate.
                 self._pairwise.pop(uname, None)
                 self._dh_pending.pop(uname, None)
         elif event == "nick":
             old = header.get("old_nick", "?")
             new = header.get("new_nick", "?")
-            print(utils.format_system(f"{old} is now known as {new}.", ts))
+            utils.print_msg(utils.format_system(f"{old} is now known as {new}.", ts))
             # Move ALL pairwise state to new nick — including in-flight handshakes.
             # Without migrating _dh_pending, a dh_resp from the renamed user
             # arrives with the new name but is silently dropped (not found in pending).
@@ -822,15 +822,15 @@ class NoEyesClient:
             if old in self._msg_queue:
                 self._msg_queue[new] = self._msg_queue.pop(old)
         elif event == "rate_limit":
-            print(utils.cwarn("[warn] You are sending messages too fast."))
+            utils.print_msg(utils.cwarn("[warn] You are sending messages too fast."))
         elif event == "nick_error":
-            print(utils.cwarn(f"[nick] {header.get('message', 'Nick change failed.')}"))
+            utils.print_msg(utils.cwarn(f"[nick] {header.get('message', 'Nick change failed.')}"))
 
     def _handle_command(self, header: dict, ts: str) -> None:
         event = header.get("event", "")
         if event == "users_resp":
             users = header.get("users", [])
-            print(utils.cinfo(f"[users] Online in '{header.get('room', self.room)}': "
+            utils.print_msg(utils.cinfo(f"[users] Online in '{header.get('room', self.room)}': "
                               + ", ".join(users) or "(none)"))
 
     # ------------------------------------------------------------------
@@ -841,7 +841,7 @@ class NoEyesClient:
         try:
             while self._running:
                 try:
-                    line = input()
+                    line = utils.read_line_noecho()
                 except EOFError:
                     break
                 if not line:
@@ -900,30 +900,30 @@ class NoEyesClient:
             new_room = parts[1]
             self._send({"type": "command", "event": "join_room", "room": new_room})
             self.room = new_room
-            print(utils.cinfo(f"[join] Switched to room '{new_room}'."))
+            utils.print_msg(utils.cinfo(f"[join] Switched to room '{new_room}'."))
             self._room_fernet = enc.derive_room_fernet(self._master_key_bytes, new_room)
             return
 
         if cmd == "/anim" and len(parts) >= 2:
             if parts[1].lower() in ("on", "1", "yes"):
                 self._anim_enabled = True
-                print(utils.cok("[anim] Decrypt animation ON."))
+                utils.print_msg(utils.cok("[anim] Decrypt animation ON."))
             elif parts[1].lower() in ("off", "0", "no"):
                 self._anim_enabled = False
-                print(utils.cinfo("[anim] Decrypt animation OFF."))
+                utils.print_msg(utils.cinfo("[anim] Decrypt animation OFF."))
             else:
                 state = "ON" if self._anim_enabled else "OFF"
-                print(utils.cinfo(f"[anim] Currently {state}. Use /anim on or /anim off."))
+                utils.print_msg(utils.cinfo(f"[anim] Currently {state}. Use /anim on or /anim off."))
             return
 
         if cmd == "/leave":
             # Leave current room and return to general
             if self.room == "general":
-                print(utils.cinfo("[leave] You are already in 'general'."))
+                utils.print_msg(utils.cinfo("[leave] You are already in 'general'."))
             else:
                 self._send({"type": "command", "event": "join_room", "room": "general"})
                 self.room = "general"
-                print(utils.cinfo("[leave] Returned to room 'general'."))
+                utils.print_msg(utils.cinfo("[leave] Returned to room 'general'."))
                 self._room_fernet = enc.derive_room_fernet(self._master_key_bytes, "general")
             return
 
@@ -931,7 +931,7 @@ class NoEyesClient:
             peer = parts[1]
             text = parts[2]
             if peer == self.username:
-                print(utils.cwarn("[msg] Cannot send a private message to yourself."))
+                utils.print_msg(utils.cwarn("[msg] Cannot send a private message to yourself."))
                 return
             if peer in self._pairwise:
                 self._send_privmsg_encrypted(peer, text)
@@ -945,7 +945,7 @@ class NoEyesClient:
             self._send_file(peer, filepath)
             return
 
-        print(utils.cwarn(f"[warn] Unknown command: {cmd}. Type /help for help."))
+        utils.print_msg(utils.cwarn(f"[warn] Unknown command: {cmd}. Type /help for help."))
 
     def _send_file(self, peer: str, filepath: str) -> None:
         """
@@ -962,11 +962,11 @@ class NoEyesClient:
         """
         path = Path(filepath).expanduser()
         if not path.exists():
-            print(utils.cerr(f"[send] File not found: {filepath}"))
+            utils.print_msg(utils.cerr(f"[send] File not found: {filepath}"))
             return
         pairwise = self._pairwise.get(peer)
         if pairwise is None:
-            print(utils.cwarn(f"[send] No pairwise key with {peer} — /msg them first."))
+            utils.print_msg(utils.cwarn(f"[send] No pairwise key with {peer} — /msg them first."))
             return
 
         import uuid, hashlib as _hl, queue as _q, time as _t
@@ -978,7 +978,7 @@ class NoEyesClient:
         # Per-transfer AES-256-GCM key derived from pairwise Fernet — no extra handshake
         gcm_key = enc.derive_file_cipher_key(pairwise, tid)
 
-        print(utils.cinfo(
+        utils.print_msg(utils.cinfo(
             f"[send] '{path.name}' → {peer}  {_human_size(file_size)}, {total} chunk(s)"
         ))
 
@@ -993,7 +993,7 @@ class NoEyesClient:
             {"type": "privmsg", "to": peer, "from": self.username, "subtype": "file_start"},
             start_payload,
         ):
-            print(utils.cerr("[send] Failed sending file_start."))
+            utils.print_msg(utils.cerr("[send] Failed sending file_start."))
             return
 
         # Pipeline: producer thread reads+hashes+GCM-encrypts while main thread sends
@@ -1012,7 +1012,7 @@ class NoEyesClient:
                         hasher.update(chunk)
                         enc_queue.put((i, enc.gcm_encrypt(gcm_key, chunk)))
             except Exception as ex:
-                print(utils.cerr(f"[send] Encrypt error: {ex}"))
+                utils.print_msg(utils.cerr(f"[send] Encrypt error: {ex}"))
                 send_failed.set()
             finally:
                 enc_queue.put(None)
@@ -1036,7 +1036,7 @@ class NoEyesClient:
                  "subtype": "file_chunk_bin"},
                 bin_payload,
             ):
-                print(utils.cerr(f"[send] Failed on chunk {i+1}/{total}."))
+                utils.print_msg(utils.cerr(f"[send] Failed on chunk {i+1}/{total}."))
                 send_failed.set()
                 break
             sent += 1
@@ -1058,10 +1058,10 @@ class NoEyesClient:
             {"type": "privmsg", "to": peer, "from": self.username, "subtype": "file_end"},
             end_payload,
         ):
-            print(utils.cerr("[send] Failed sending file_end."))
+            utils.print_msg(utils.cerr("[send] Failed sending file_end."))
             return
 
-        print(utils.cok(
+        utils.print_msg(utils.cok(
             f"[send] ✓ '{path.name}' sent "
             f"({_human_size(file_size)} @ {file_size/(_t.perf_counter()-t0)/1024/1024:.0f} MB/s)"
         ))
@@ -1080,4 +1080,4 @@ Commands:
   /send <user> <file>  Send a file (encrypted, requires established DH).
   /anim <on|off>       Toggle the decrypt animation for incoming messages.
 """
-        print(utils.cinfo(help_text))
+        utils.print_msg(utils.cinfo(help_text))

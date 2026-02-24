@@ -27,7 +27,6 @@ BRIGHT_WHITE = "\033[1;37m"
 
 
 def _is_tty() -> bool:
-    """True if we are attached to a real terminal (robust check)."""
     try:
         return os.isatty(sys.stdout.fileno())
     except Exception:
@@ -35,40 +34,24 @@ def _is_tty() -> bool:
 
 
 def colorize(text: str, color: str, bold: bool = False) -> str:
-    """Wrap *text* with ANSI escape codes if stdout is a TTY."""
     if not _is_tty():
         return text
     prefix = BOLD if bold else ""
     return f"{prefix}{color}{text}{RESET}"
 
 
-def cinfo(msg: str) -> str:
-    return colorize(msg, CYAN)
-
-
-def cwarn(msg: str) -> str:
-    return colorize(msg, YELLOW, bold=True)
-
-
-def cerr(msg: str) -> str:
-    return colorize(msg, RED, bold=True)
-
-
-def cok(msg: str) -> str:
-    return colorize(msg, GREEN)
-
-
-def cgrey(msg: str) -> str:
-    return colorize(msg, GREY)
+def cinfo(msg: str)  -> str: return colorize(msg, CYAN)
+def cwarn(msg: str)  -> str: return colorize(msg, YELLOW, bold=True)
+def cerr(msg: str)   -> str: return colorize(msg, RED,    bold=True)
+def cok(msg: str)    -> str: return colorize(msg, GREEN)
+def cgrey(msg: str)  -> str: return colorize(msg, GREY)
 
 
 # ---------------------------------------------------------------------------
 # Screen helpers
 # ---------------------------------------------------------------------------
 
-
 def clear_screen() -> None:
-    """Clear the terminal screen (cross-platform)."""
     os.system("cls" if os.name == "nt" else "clear")
 
 
@@ -88,33 +71,76 @@ BANNER = r"""
 
 
 def print_banner() -> None:
-    """Print the ASCII banner with colour if the terminal supports it."""
     print(colorize(BANNER, CYAN, bold=True))
 
 
 # ---------------------------------------------------------------------------
-# Decrypt animation
+# Global input state
 #
-# Two-phase cinematic effect on every incoming message:
+# read_line_noecho() writes every typed char into _g_buf and sets
+# _g_input_active = True.  Any thread that wants to print something calls
+# print_msg() which:
+#   1. acquires _OUTPUT_LOCK
+#   2. erases the current partial input (if any) from the screen
+#   3. prints the message
+#   4. redraws the partial input so the user can keep typing
+#   5. releases _OUTPUT_LOCK
 #
-#   Phase 1 — CIPHER: exactly len(plaintext) random characters from a
-#              cinematic noise pool stream out in shifting purple/magenta.
-#              Each char picks a different shade — not a flat block of colour.
-#
-#   Phase 2 — REVEAL: cursor rewinds (save/restore — works after line-wrap)
-#              and the real plaintext types over the cipher position-by-
-#              position.  Each character flashes bright-white for one tick
-#              then settles to normal: the "lock-in" feel.
-#
-# A threading.Lock() serialises concurrent messages so two animations never
-# interleave.  chat and privmsg share a single _run_animation() core.
-#
-# Toggle: /anim on|off  (stored in NoEyesClient._anim_enabled)
-# Non-TTY: animation skipped entirely — plain print, no side effects.
+# This means incoming messages, animations, status lines — everything —
+# always land cleanly above the input line regardless of race conditions.
 # ---------------------------------------------------------------------------
 
-# Character pool — box-drawing, block-elements, braille dots, symbol noise.
-# No letters/digits: looks like encrypted noise, not garbled plaintext.
+_OUTPUT_LOCK    = threading.Lock()   # serialises ALL terminal writes
+_g_buf          : list  = []         # chars typed so far (shared with input thread)
+_g_input_active : bool  = False      # True while noecho loop is running
+
+
+def _get_tw() -> int:
+    try:
+        return os.get_terminal_size().columns
+    except OSError:
+        return 80
+
+
+def _erase_input_unsafe() -> None:
+    """Erase the current partial input from the screen (no lock — caller holds it)."""
+    if not _g_input_active or not _g_buf:
+        return
+    tw = _get_tw()
+    n  = len(_g_buf)
+    lines_up = (n - 1) // tw   # number of extra rows above the last row
+    if lines_up:
+        sys.stdout.write("\033[" + str(lines_up) + "A")
+    sys.stdout.write("\r\033[J")
+    sys.stdout.flush()
+
+
+def _redraw_input_unsafe() -> None:
+    """Redraw the partial input after a message was printed (no lock — caller holds it)."""
+    if not _g_input_active or not _g_buf:
+        return
+    sys.stdout.write("".join(_g_buf))
+    sys.stdout.flush()
+
+
+def print_msg(text: str) -> None:
+    """
+    Print a line of output, cleanly interleaving with any in-progress input.
+    ALL output in the client must go through this function (or print_msg_raw).
+    """
+    if not _is_tty():
+        print(text)
+        return
+    with _OUTPUT_LOCK:
+        _erase_input_unsafe()
+        print(text)
+        _redraw_input_unsafe()
+
+
+# ---------------------------------------------------------------------------
+# Decrypt animation
+# ---------------------------------------------------------------------------
+
 _CIPHER_POOL = list(
     "─│┌┐└┘├┤┬┴┼╔╗╚╝╠╣╦╩╬═║╒╓╕╖╘╙╛╜╞╟╡╢╤╥╧╨╪╫"
     "░▒▓█▀▄▌▐▖▗▘▙▚▛▜▝▞▟"
@@ -123,7 +149,6 @@ _CIPHER_POOL = list(
     "·×÷±∑∏∂∇∞∴≈≠≡≤≥"
 )
 
-# Cyan shades — matches the NoEyes logo colour
 _CIPHER_COLORS = [
     "\033[36m",    # cyan
     "\033[1;36m",  # bright cyan
@@ -131,86 +156,58 @@ _CIPHER_COLORS = [
     "\033[1;96m",  # bold light cyan
 ]
 
-# ── Timing ──────────────────────────────────────────────────────────────────
-_CIPHER_CHAR_DELAY = 0.022   # s per cipher char
-_REVEAL_PAUSE      = 0.38    # s pause between phases (the "moment of decryption")
-_PLAIN_CHAR_MAX    = 0.060   # s per plaintext char (cap for short messages)
-_PLAIN_TOTAL_CAP   = 2.0     # s max total for the whole plaintext phase
-
-# VT100 cursor save/restore — supported by every modern terminal
-
-# Serialise all animation writes so concurrent arrivals never interleave
-_ANIM_LOCK = threading.Lock()
+_CIPHER_CHAR_DELAY = 0.022
+_REVEAL_PAUSE      = 0.38
+_PLAIN_CHAR_MAX    = 0.060
+_PLAIN_TOTAL_CAP   = 2.0
 
 
 def _strip_ansi(s: str) -> str:
-    """Strip ANSI escape codes to get the printable-only string."""
     return re.sub(r"\033\[[0-9;]*m", "", s)
 
 
 def _run_animation(prefix: str, plaintext: str) -> None:
     """
-    Wave-decrypt animation.
-
-    Phase 1 — wave: cipher chars stream forward while reveal chases 6 behind.
-               At each step i: write cipher char at position i, then jump back
-               WAVE+1 cols to overwrite position i-WAVE with the real char,
-               then jump forward WAVE cols back to the end.
-               Safe only when the back-jump doesn't cross a line boundary
-               (cursor_col >= WAVE+1). Any position that can't be wave-revealed
-               is handled by the cleanup pass.
-
-    Phase 2 — cleanup: move cursor back to start, overwrite everything with
-               full plaintext instantly. Snaps any leftover cipher chars clean.
-
-    If n < WAVE: skip the wave, fall through to plain full-cipher then cleanup.
+    Wave-decrypt animation. Called while _OUTPUT_LOCK is held.
+    Input line is already erased; we redraw it at the end.
     """
     WAVE = 6
-    n = len(plaintext)
+    n    = len(plaintext)
     if n == 0:
         sys.stdout.write(prefix + "\n")
         sys.stdout.flush()
         return
 
-    try:
-        term_width = os.get_terminal_size().columns
-    except OSError:
-        term_width = 80
-
+    tw         = _get_tw()
     prefix_vis = len(_strip_ansi(prefix))
 
-    # ── Phase 1: wave stream ──────────────────────────────────────────────────
+    # ── Phase 1: wave stream ──────────────────────────────────────────────
     sys.stdout.write(prefix)
     sys.stdout.flush()
 
     for i in range(n):
-        # Write cipher char at current position (cursor advances by 1)
         sys.stdout.write(random.choice(_CIPHER_COLORS) + random.choice(_CIPHER_POOL) + RESET)
         sys.stdout.flush()
 
         reveal_i = i - WAVE
         if reveal_i >= 0:
-            # cursor_col: column the cursor is at after writing cipher char i
-            cursor_col = (prefix_vis + i + 1) % term_width
+            cursor_col = (prefix_vis + i + 1) % tw
             if cursor_col >= WAVE + 1:
-                # Safe: jump back WAVE+1, write plaintext char, jump forward WAVE
                 sys.stdout.write(
-                    f"\033[{WAVE + 1}D"
+                    "\033[" + str(WAVE + 1) + "D"
                     + plaintext[reveal_i]
-                    + f"\033[{WAVE}C"
+                    + "\033[" + str(WAVE) + "C"
                 )
                 sys.stdout.flush()
-            # else: crosses a line boundary — cleanup pass handles it
 
         time.sleep(_CIPHER_CHAR_DELAY)
 
-    # Brief pause — shorter than normal since decryption already started
     time.sleep(_REVEAL_PAUSE * 0.4)
 
-    # ── Phase 2: instant cleanup — snap all remaining cipher to plaintext ─────
-    lines_up = (prefix_vis + n) // term_width
+    # ── Phase 2: cleanup ──────────────────────────────────────────────────
+    lines_up = (prefix_vis + n) // tw
     if lines_up:
-        sys.stdout.write(f"\033[{lines_up}A")
+        sys.stdout.write("\033[" + str(lines_up) + "A")
     sys.stdout.write("\r" + prefix + plaintext + "\n")
     sys.stdout.flush()
 
@@ -222,17 +219,18 @@ def chat_decrypt_animation(
     msg_ts: str,
     anim_enabled: bool = True,
 ) -> None:
-    """Display an incoming group-chat message with the decrypt animation."""
     ts_part   = cgrey(f"[{msg_ts}]")
     user_part = colorize(from_user, GREEN, bold=True)
     prefix    = f"{ts_part} {user_part}: "
 
     if not anim_enabled or not _is_tty():
-        print(prefix + plaintext)
+        print_msg(prefix + plaintext)
         return
 
-    with _ANIM_LOCK:
+    with _OUTPUT_LOCK:
+        _erase_input_unsafe()
         _run_animation(prefix, plaintext)
+        _redraw_input_unsafe()
 
 
 def privmsg_decrypt_animation(
@@ -243,33 +241,34 @@ def privmsg_decrypt_animation(
     verified: bool = False,
     anim_enabled: bool = True,
 ) -> None:
-    """Display an incoming private message with the decrypt animation."""
     ts_part  = cgrey(f"[{msg_ts}]")
     src_part = colorize(f"[PM from {from_user}]", CYAN, bold=True)
     sig_part = cok("✓") if verified else cwarn("?")
     prefix   = f"{ts_part} {src_part}{sig_part} "
 
     if not anim_enabled or not _is_tty():
-        print(prefix + plaintext)
+        print_msg(prefix + plaintext)
         return
 
-    with _ANIM_LOCK:
+    with _OUTPUT_LOCK:
+        _erase_input_unsafe()
         _run_animation(prefix, plaintext)
+        _redraw_input_unsafe()
 
 
 # ---------------------------------------------------------------------------
-# Misc helpers
+# No-echo input
 # ---------------------------------------------------------------------------
-
 
 def read_line_noecho() -> str:
     """
-    Read a line from stdin, showing characters as typed, but erasing the
-    entire input line(s) the moment Enter is pressed — so the formatted
-    message can be printed cleanly in its place.
-
+    Read a line from stdin with manual echo.  Characters are written into
+    _g_buf so that any concurrent print_msg() call can erase/redraw them.
+    On Enter: erase the input line(s) cleanly, return the string.
     Falls back to plain input() when stdin is not a TTY.
     """
+    global _g_input_active, _g_buf
+
     if not sys.stdin.isatty():
         return input()
 
@@ -277,92 +276,88 @@ def read_line_noecho() -> str:
 
     fd           = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
-    buf          = []
+    result       = ""
+
+    with _OUTPUT_LOCK:
+        _g_buf          = []
+        _g_input_active = True
+
     try:
         tty.setcbreak(fd)
         while True:
             ch = sys.stdin.read(1)
 
             if ch in ("\n", "\r"):
-                # Erase what was typed, then return — no trailing newline here,
-                # the formatted print() below will supply it.
-                try:
-                    tw = os.get_terminal_size().columns
-                except OSError:
-                    tw = 80
-                typed_len = len(buf)
-                lines_up  = (typed_len + tw - 1) // tw if typed_len else 1
-                sys.stdout.write("\033[" + str(lines_up) + "A\r\033[J")
-                sys.stdout.flush()
+                with _OUTPUT_LOCK:
+                    result          = "".join(_g_buf)
+                    _erase_input_unsafe()
+                    _g_input_active = False
+                    _g_buf          = []
                 break
 
-            elif ch == "\x03":        # Ctrl-C
+            elif ch == "\x03":
+                with _OUTPUT_LOCK:
+                    _g_input_active = False
+                    _g_buf          = []
                 raise KeyboardInterrupt
 
-            elif ch == "\x04":        # Ctrl-D / EOF
+            elif ch == "\x04":
+                with _OUTPUT_LOCK:
+                    _g_input_active = False
+                    _g_buf          = []
                 raise EOFError
 
-            elif ch in ("\x7f", "\x08"):  # Backspace / DEL
-                if buf:
-                    buf.pop()
-                    sys.stdout.write("\b \b")  # erase last visible char
-                    sys.stdout.flush()
+            elif ch in ("\x7f", "\x08"):  # Backspace
+                with _OUTPUT_LOCK:
+                    if _g_buf:
+                        _g_buf.pop()
+                        sys.stdout.write("\b \b")
+                        sys.stdout.flush()
 
-            elif ch == "\x1b":        # escape sequence (arrow keys etc) — skip
+            elif ch == "\x1b":             # Escape / arrow keys — swallow
                 nxt = sys.stdin.read(1)
                 if nxt == "[":
-                    sys.stdin.read(1)  # swallow final byte of CSI sequence
+                    sys.stdin.read(1)
 
-            elif ch >= " ":            # printable — echo and buffer
-                buf.append(ch)
-                sys.stdout.write(ch)
-                sys.stdout.flush()
+            elif ch >= " ":                 # Printable char
+                with _OUTPUT_LOCK:
+                    _g_buf.append(ch)
+                    sys.stdout.write(ch)
+                    sys.stdout.flush()
 
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        with _OUTPUT_LOCK:
+            _g_input_active = False
+            _g_buf          = []
 
-    return "".join(buf)
+    return result
 
 
-def erase_input(raw: str) -> None:
-    """Erase the raw typed input line(s) from the terminal.
-    Uses move-up + erase-to-end so wrapped long inputs are fully cleared.
-    """
-    if not _is_tty():
-        return
-    try:
-        tw = os.get_terminal_size().columns
-    except OSError:
-        tw = 80
-    wrap_lines = (len(raw) + tw - 1) // tw  # ceiling: always >= 1
-    sys.stdout.write("\033[" + str(wrap_lines) + "A")  # move up
-    sys.stdout.write("\r\033[J")  # col 0, erase to end of screen
-    sys.stdout.flush()
 
+# ---------------------------------------------------------------------------
+# Misc helpers
+# ---------------------------------------------------------------------------
 
 def format_message(username: str, text: str, timestamp: str) -> str:
-    """Format a chat line for display (incoming — other users)."""
     ts  = cgrey(f"[{timestamp}]")
     usr = colorize(username, GREEN, bold=True)
     return f"{ts} {usr}: {text}"
 
 
 def format_own_message(username: str, text: str, timestamp: str) -> str:
-    """Format a sent message — own name in bold yellow to stand out from others."""
     ts  = cgrey(f"[{timestamp}]")
     usr = colorize(username, YELLOW, bold=True)
     return f"{ts} {usr}: {text}"
 
 
 def format_system(text: str, timestamp: str) -> str:
-    """Format a system/event line for display."""
-    ts = cgrey(f"[{timestamp}]")
+    ts  = cgrey(f"[{timestamp}]")
     tag = colorize("[SYSTEM]", YELLOW, bold=True)
     return f"{ts} {tag} {text}"
 
 
 def format_privmsg(from_user: str, text: str, timestamp: str, verified: bool) -> str:
-    """Format a private message line, noting signature status."""
     ts  = cgrey(f"[{timestamp}]")
     src = colorize(f"[PM from {from_user}]", CYAN, bold=True)
     sig = cok("✓") if verified else cwarn("?")
