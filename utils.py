@@ -262,6 +262,68 @@ def privmsg_decrypt_animation(
 # ---------------------------------------------------------------------------
 
 
+def read_line_noecho() -> str:
+    """
+    Read a line from stdin, showing characters as typed, but erasing the
+    entire input line(s) the moment Enter is pressed — so the formatted
+    message can be printed cleanly in its place.
+
+    Falls back to plain input() when stdin is not a TTY.
+    """
+    if not sys.stdin.isatty():
+        return input()
+
+    import termios, tty
+
+    fd           = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    buf          = []
+    try:
+        tty.setcbreak(fd)
+        while True:
+            ch = sys.stdin.read(1)
+
+            if ch in ("\n", "\r"):
+                # Erase what was typed, then return — no trailing newline here,
+                # the formatted print() below will supply it.
+                try:
+                    tw = os.get_terminal_size().columns
+                except OSError:
+                    tw = 80
+                typed_len = len(buf)
+                lines_up  = (typed_len + tw - 1) // tw if typed_len else 1
+                sys.stdout.write("\033[" + str(lines_up) + "A\r\033[J")
+                sys.stdout.flush()
+                break
+
+            elif ch == "\x03":        # Ctrl-C
+                raise KeyboardInterrupt
+
+            elif ch == "\x04":        # Ctrl-D / EOF
+                raise EOFError
+
+            elif ch in ("\x7f", "\x08"):  # Backspace / DEL
+                if buf:
+                    buf.pop()
+                    sys.stdout.write("\b \b")  # erase last visible char
+                    sys.stdout.flush()
+
+            elif ch == "\x1b":        # escape sequence (arrow keys etc) — skip
+                nxt = sys.stdin.read(1)
+                if nxt == "[":
+                    sys.stdin.read(1)  # swallow final byte of CSI sequence
+
+            elif ch >= " ":            # printable — echo and buffer
+                buf.append(ch)
+                sys.stdout.write(ch)
+                sys.stdout.flush()
+
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    return "".join(buf)
+
+
 def erase_input(raw: str) -> None:
     """Erase the raw typed input line(s) from the terminal.
     Uses move-up + erase-to-end so wrapped long inputs are fully cleared.
@@ -272,9 +334,8 @@ def erase_input(raw: str) -> None:
         tw = os.get_terminal_size().columns
     except OSError:
         tw = 80
-    wrap_lines = len(raw) // tw
-    if wrap_lines:
-        sys.stdout.write("\033[" + str(wrap_lines) + "A")  # move up
+    wrap_lines = (len(raw) + tw - 1) // tw  # ceiling: always >= 1
+    sys.stdout.write("\033[" + str(wrap_lines) + "A")  # move up
     sys.stdout.write("\r\033[J")  # col 0, erase to end of screen
     sys.stdout.flush()
 
