@@ -136,13 +136,8 @@ _CIPHER_CHAR_DELAY = 0.022   # s per cipher char
 _REVEAL_PAUSE      = 0.38    # s pause between phases (the "moment of decryption")
 _PLAIN_CHAR_MAX    = 0.060   # s per plaintext char (cap for short messages)
 _PLAIN_TOTAL_CAP   = 2.0     # s max total for the whole plaintext phase
-_FLASH_DUR         = 0.028   # s a char stays bright-white before settling
 
 # VT100 cursor save/restore — supported by every modern terminal
-_CUR_SAVE    = "\033[s"
-_CUR_RESTORE = "\033[u"
-_CUR_BACK1   = "\033[1D"
-_ERASE_EOL   = "\033[K"
 
 # Serialise all animation writes so concurrent arrivals never interleave
 _ANIM_LOCK = threading.Lock()
@@ -180,50 +175,36 @@ def _run_animation(prefix: str, plaintext: str) -> None:
 
     prefix_vis = len(_strip_ansi(prefix))
 
-    # Limit cipher chars to at most one full screen-width past the prefix
-    # so the cipher phase never runs on for more than 2 lines.
-    max_cipher = max(4, term_width - prefix_vis + term_width - 1)
-    cipher_n   = min(n, max_cipher)
+    # Cipher chars must fit on the same line as the prefix — never wrap.
+    cipher_n = min(n, max(4, term_width - prefix_vis - 1))
 
-    # ── Phase 1: stream cipher noise ─────────────────────────────────────────
+    # ── Phase 1: print prefix once, then stream cipher chars ─────────────────
     sys.stdout.write(prefix)
     sys.stdout.flush()
 
     for _ in range(cipher_n):
-        ch    = random.choice(_CIPHER_POOL)
-        color = random.choice(_CIPHER_COLORS)
-        sys.stdout.write(color + ch + RESET)
+        sys.stdout.write(random.choice(_CIPHER_COLORS) + random.choice(_CIPHER_POOL) + RESET)
         sys.stdout.flush()
         time.sleep(_CIPHER_CHAR_DELAY)
 
     time.sleep(_REVEAL_PAUSE)
 
-    # ── Phase 2: erase ALL cipher rows, retype, reveal plaintext ─────────────
-    # Calculate how many terminal rows the cipher block occupies.
-    cipher_total_cols = prefix_vis + cipher_n
-    rows_used = max(1, (cipher_total_cols + term_width - 1) // term_width)
-
-    # Move cursor back up to the first row of the cipher block.
-    if rows_used > 1:
-        sys.stdout.write(f"\033[{rows_used - 1}A")  # move up N-1 rows
-
-    # \r → column 0, \033[J → erase from cursor to end of screen (all rows)
-    sys.stdout.write("\r\033[J" + prefix)
+    # ── Phase 2: \r back to line start, reprint prefix, type plaintext ───────
+    # The prefix overwrites itself (same bytes, same width).
+    # Each plaintext char overwrites the cipher char that was in that column.
+    # NO line-erase escape — that's what caused the flash/disappear.
+    sys.stdout.write("\r" + prefix)
     sys.stdout.flush()
 
-    # Type plaintext with lock-in flash on each char
-    per_char   = min(_PLAIN_CHAR_MAX, _PLAIN_TOTAL_CAP / n)
-    settle_dur = max(0.0, per_char - _FLASH_DUR)
-
+    per_char = min(_PLAIN_CHAR_MAX, _PLAIN_TOTAL_CAP / n)
     for ch in plaintext:
-        sys.stdout.write(BRIGHT_WHITE + ch + RESET)
+        sys.stdout.write(ch)
         sys.stdout.flush()
-        time.sleep(_FLASH_DUR)
-        sys.stdout.write(_CUR_BACK1 + ch)
-        sys.stdout.flush()
-        time.sleep(settle_dur)
+        time.sleep(per_char)
 
-    sys.stdout.write("\n")
+    # Erase any leftover cipher chars to the right of the cursor
+    # (happens when plaintext is shorter than cipher_n)
+    sys.stdout.write("\033[K\n")
     sys.stdout.flush()
 
 
