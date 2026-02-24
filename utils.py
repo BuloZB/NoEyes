@@ -150,16 +150,22 @@ def _strip_ansi(s: str) -> str:
 
 def _run_animation(prefix: str, plaintext: str) -> None:
     """
-    Two-phase cinematic decrypt animation — wrap-proof.
+    Wave-decrypt animation.
 
-    Phase 1: stream n cipher chars in cyan (exactly matches plaintext length),
-             wrapping freely across lines.
+    Phase 1 — wave: cipher chars stream forward while reveal chases 6 behind.
+               At each step i: write cipher char at position i, then jump back
+               WAVE+1 cols to overwrite position i-WAVE with the real char,
+               then jump forward WAVE cols back to the end.
+               Safe only when the back-jump doesn't cross a line boundary
+               (cursor_col >= WAVE+1). Any position that can't be wave-revealed
+               is handled by the cleanup pass.
 
-    Phase 2: move cursor back up using (prefix_vis + n) // term_width,
-             go to col 0, reprint prefix, then type each plaintext char one
-             by one with a short delay.  NO cursor tricks during the reveal —
-             that was causing wrap corruption when flicker chars hit line ends.
+    Phase 2 — cleanup: move cursor back to start, overwrite everything with
+               full plaintext instantly. Snaps any leftover cipher chars clean.
+
+    If n < WAVE: skip the wave, fall through to plain full-cipher then cleanup.
     """
+    WAVE = 6
     n = len(plaintext)
     if n == 0:
         sys.stdout.write(prefix + "\n")
@@ -173,37 +179,39 @@ def _run_animation(prefix: str, plaintext: str) -> None:
 
     prefix_vis = len(_strip_ansi(prefix))
 
-    # ── Phase 1: stream cipher noise ─────────────────────────────────────────
+    # ── Phase 1: wave stream ──────────────────────────────────────────────────
     sys.stdout.write(prefix)
     sys.stdout.flush()
 
-    for _ in range(n):
+    for i in range(n):
+        # Write cipher char at current position (cursor advances by 1)
         sys.stdout.write(random.choice(_CIPHER_COLORS) + random.choice(_CIPHER_POOL) + RESET)
         sys.stdout.flush()
+
+        reveal_i = i - WAVE
+        if reveal_i >= 0:
+            # cursor_col: column the cursor is at after writing cipher char i
+            cursor_col = (prefix_vis + i + 1) % term_width
+            if cursor_col >= WAVE + 1:
+                # Safe: jump back WAVE+1, write plaintext char, jump forward WAVE
+                sys.stdout.write(
+                    f"\033[{WAVE + 1}D"
+                    + plaintext[reveal_i]
+                    + f"\033[{WAVE}C"
+                )
+                sys.stdout.flush()
+            # else: crosses a line boundary — cleanup pass handles it
+
         time.sleep(_CIPHER_CHAR_DELAY)
 
-    time.sleep(_REVEAL_PAUSE)
+    # Brief pause — shorter than normal since decryption already started
+    time.sleep(_REVEAL_PAUSE * 0.4)
 
-    # ── Move back to start of cipher block ───────────────────────────────────
-    # After writing prefix_vis + n chars from col 0, cursor is on row:
-    #   (prefix_vis + n) // term_width  (integer division)
+    # ── Phase 2: instant cleanup — snap all remaining cipher to plaintext ─────
     lines_up = (prefix_vis + n) // term_width
     if lines_up:
         sys.stdout.write(f"\033[{lines_up}A")
-    sys.stdout.write("\r" + prefix)
-    sys.stdout.flush()
-
-    # ── Phase 2: overwrite cipher with plaintext, char by char ───────────────
-    # Deliberately NO cursor movement here — any move that wraps a line will
-    # corrupt the column math and cause partial overwrites.
-    per_char = min(_PLAIN_CHAR_MAX, _PLAIN_TOTAL_CAP / n)
-
-    for ch in plaintext:
-        sys.stdout.write(ch)
-        sys.stdout.flush()
-        time.sleep(per_char)
-
-    sys.stdout.write("\n")
+    sys.stdout.write("\r" + prefix + plaintext + "\n")
     sys.stdout.flush()
 
 
