@@ -29,6 +29,8 @@ def _resolve_fernet(cfg: dict):
 
     Priority: --key-file > --key > interactive passphrase prompt.
     """
+    from cryptography.fernet import Fernet
+
     if cfg.get("key_file"):
         return enc.load_key_file(cfg["key_file"])
 
@@ -59,6 +61,45 @@ def _get_username(cfg: dict) -> str:
     return uname
 
 
+def _start_bore(port: int) -> None:
+    """
+    Launch bore in background and print the public address once it appears.
+    Silently skips if bore is not installed.
+    """
+    import subprocess, threading, shutil, re
+
+    if not shutil.which("bore"):
+        print(utils.cgrey(
+            "[bore] not installed — run without tunnel.\n"
+            "       Install: https://github.com/ekzhang/bore (see README)"
+        ))
+        return
+
+    def _run():
+        try:
+            proc = subprocess.Popen(
+                ["bore", "local", str(port), "--to", "bore.pub"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            for line in proc.stdout:
+                m = re.search(r"bore\.pub:(\d+)", line)
+                if m:
+                    p = m.group(1)
+                    print(utils.cinfo(
+                        f"\n  ┌─ bore tunnel active ─────────────────────────────\n"
+                        f"  │  address : bore.pub:{p}\n"
+                        f"  │  share   : python noeyes.py --connect bore.pub --port {p} --key-file ./chat.key\n"
+                        f"  └──────────────────────────────────────────────────\n"
+                    ))
+                    break
+        except Exception as e:
+            print(utils.cgrey(f"[bore] failed to start: {e}"))
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def run_server(cfg: dict) -> None:
     from server import NoEyesServer
 
@@ -71,6 +112,8 @@ def run_server(cfg: dict) -> None:
 
     if cfg.get("daemon"):
         _daemonize()
+
+    _start_bore(cfg["port"])
 
     server.run()
 
