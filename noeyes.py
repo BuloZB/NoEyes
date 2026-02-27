@@ -45,6 +45,16 @@ def _resolve_fernet(cfg: dict):
         else:
             print(utils.cerr("[error] No key or key-file provided."))
             sys.exit(1)
+    else:
+        # Security warning: the passphrase is visible in `ps aux` and in
+        # shell history to any local user who can read /proc/<pid>/cmdline.
+        # --key-file is always safer — the passphrase never touches argv.
+        print(utils.cwarn(
+            "[security] WARNING: passphrase passed via --key is visible in\n"
+            "           `ps aux` and shell history. Use --key-file instead:\n"
+            "             python noeyes.py --gen-key --key-file ./chat.key\n"
+            "             python noeyes.py --connect HOST --key-file ./chat.key"
+        ))
 
     return enc.derive_fernet_key(passphrase)
 
@@ -108,6 +118,8 @@ def run_server(cfg: dict) -> None:
         port=cfg["port"],
         history_size=cfg["history_size"],
         rate_limit_per_minute=cfg["rate_limit_per_minute"],
+        ssl_cert=cfg.get("cert") or "",
+        ssl_key=cfg.get("tls_key") or "",
     )
 
     if cfg.get("daemon"):

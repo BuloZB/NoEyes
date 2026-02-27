@@ -17,6 +17,7 @@ Wire protocol:
 
 import base64
 import json
+import os
 import queue
 import readline  # enables arrow keys, history, line editing in input()
 import socket
@@ -116,6 +117,13 @@ def recv_frame(sock: socket.socket) -> Optional[tuple[dict, bytes]]:
     if header_len == 0 or header_len > 65536:
         return None
 
+    # Guard against oversized payloads.
+    # A compromised or malicious server could send payload_len = 4 GB to OOM
+    # the client.  Cap matches the server-side MAX_PAYLOAD constant.
+    _MAX_PAYLOAD = 16 * 1024 * 1024  # 16 MB — same as server.MAX_PAYLOAD
+    if payload_len > _MAX_PAYLOAD:
+        return None
+
     header_bytes  = _recv_exact(sock, header_len)
     if header_bytes is None:
         return None
@@ -156,18 +164,24 @@ class NoEyesClient:
         identity_path: str = "~/.noeyes/identity.key",
         tofu_path: str     = "~/.noeyes/tofu_pubkeys.json",
         reconnect: bool    = True,
+        tls: bool          = False,
+        tls_cert: str      = "",   # path to CA cert for server verification (optional)
     ):
         self.host          = host
         self.port          = port
-        self.username      = username
+        # Normalise to lowercase — must match server-side normalisation so that
+        # TOFU lookups and pairwise-key dictionaries use the same keys everywhere.
+        self.username      = username.strip().lower()[:32]
         self.group_fernet  = group_fernet
         # Store the raw master key bytes so we can re-derive per-room keys
         self._master_key_bytes: bytes = group_fernet._signing_key + group_fernet._encryption_key
-        self.room          = room
-        self._room_fernet: Fernet = enc.derive_room_fernet(self._master_key_bytes, room)
+        self.room          = room.strip().lower()[:64]
+        self._room_fernet: Fernet = enc.derive_room_fernet(self._master_key_bytes, self.room)
         self.identity_path = identity_path
         self.tofu_path     = tofu_path
         self.reconnect     = reconnect
+        self._tls          = tls
+        self._tls_cert     = tls_cert   # CA cert path, empty = system CAs
 
         # Load / generate Ed25519 identity
         self.sk_bytes, self.vk_bytes = enc.load_identity(identity_path)
@@ -205,10 +219,21 @@ class NoEyesClient:
     # ------------------------------------------------------------------
 
     def connect(self) -> bool:
-        """Open TCP socket to the server. Returns True on success."""
+        """Open TCP socket to the server (with optional TLS). Returns True on success."""
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.connect((self.host, self.port))
+            if self._tls:
+                import ssl as _ssl
+                ctx = _ssl.create_default_context()
+                if self._tls_cert:
+                    # Caller supplied a specific CA cert (self-signed server)
+                    ctx.load_verify_locations(self._tls_cert)
+                # Wrap the raw socket; server_hostname enables SNI + cert check
+                s = ctx.wrap_socket(s, server_hostname=self.host)
+                utils.print_msg(utils.cok(
+                    f"[tls] Connection to {self.host}:{self.port} is TLS-encrypted."
+                ))
             self.sock = s
             return True
         except OSError as e:
@@ -371,7 +396,7 @@ class NoEyesClient:
     # ------------------------------------------------------------------
 
     def _handle_pubkey_announce(self, header: dict) -> None:
-        uname  = header.get("username", "")
+        uname  = header.get("username", "").lower()
         vk_hex = header.get("vk_hex", "")
         if not uname or not vk_hex or uname == self.username:
             return
@@ -440,7 +465,7 @@ class NoEyesClient:
 
     def _handle_dh_init(self, header: dict, payload: bytes) -> None:
         """Respond to a dh_init from *from_user* with our DH public key."""
-        from_user = header.get("from", "")
+        from_user = header.get("from", "").lower()
         if not from_user or from_user == self.username:
             return
 
@@ -505,7 +530,7 @@ class NoEyesClient:
 
     def _handle_dh_resp(self, header: dict, payload: bytes) -> None:
         """Complete the DH exchange after receiving a dh_resp."""
-        from_user = header.get("from", "")
+        from_user = header.get("from", "").lower()
         if from_user not in self._dh_pending:
             return
 
@@ -550,6 +575,9 @@ class NoEyesClient:
             "type": "chat",
             "room": self.room,
             "from": self.username,
+            # Replay-protection ID: 16 random bytes as hex (128-bit collision space).
+            # Server rejects any frame whose mid it has already seen for this room.
+            "mid":  os.urandom(16).hex(),
         }
         self._send(header, payload)
         utils.log_and_print(self.room, utils.format_own_message(self.username, text, ts))
@@ -578,13 +606,15 @@ class NoEyesClient:
             "type": "privmsg",
             "to":   peer,
             "from": self.username,
+            # Replay-protection ID — same mechanism as group chat.
+            "mid":  os.urandom(16).hex(),
         }
         self._send( header, payload)
         utils.log_and_print(self.room, utils.format_privmsg(f"you → {peer}", text, ts, verified=True))
 
     def _handle_chat(self, header: dict, payload: bytes, ts: str) -> None:
         """Decrypt and display a group chat message."""
-        from_user = header.get("from", "?")
+        from_user = header.get("from", "?").lower()
         try:
             body = json.loads(self._room_fernet.decrypt(payload))
             text = body.get("text", "")
@@ -609,7 +639,7 @@ class NoEyesClient:
 
     def _handle_privmsg(self, header: dict, payload: bytes, ts: str) -> None:
         """Decrypt and dispatch a private message frame."""
-        from_user = header.get("from", "?")
+        from_user = header.get("from", "?").lower()
 
         pairwise = self._pairwise.get(from_user)
         if pairwise is None:
@@ -942,7 +972,7 @@ class NoEyesClient:
             return
 
         if cmd == "/msg" and len(parts) >= 3:
-            peer = parts[1]
+            peer = parts[1].lower()
             text = parts[2]
             if peer == self.username:
                 utils.print_msg(utils.cwarn("[msg] Cannot send a private message to yourself."))
@@ -954,7 +984,7 @@ class NoEyesClient:
             return
 
         if cmd == "/send" and len(parts) >= 3:
-            peer     = parts[1]
+            peer     = parts[1].lower()
             filepath = parts[2]
             self._send_file(peer, filepath)
             return

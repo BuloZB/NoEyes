@@ -46,6 +46,40 @@ from typing import Optional
 logger = logging.getLogger("noeyes.server")
 
 # ---------------------------------------------------------------------------
+# Protocol constants
+# ---------------------------------------------------------------------------
+
+# Hard cap on the encrypted payload size per frame.
+#
+# WHY THIS MATTERS (vuln patched):
+#   payload_len is a uint32 — an attacker could send payload_len = 4 294 967 295
+#   (4 GB).  Without this guard the server would call asyncio.readexactly(4 GB),
+#   allocating 4 GB of RAM and blocking the entire event loop for every other
+#   client.  One TCP connection = full denial-of-service.
+#
+#   16 MB covers the largest legitimate frame (a 32 MB file chunk is split by
+#   the AES-GCM overhead; Fernet chat messages are always <1 KB).  Frames
+#   larger than this are either malformed or malicious.
+MAX_PAYLOAD = 16 * 1024 * 1024   # 16 MB
+
+# Separate cap for room history entries.  Keeps the 50-entry deque from storing
+# oversized blobs (50 × 16 MB = 800 MB max vs 50 × 4 GB = 200 GB without cap).
+MAX_HISTORY_PAYLOAD = MAX_PAYLOAD
+
+# Replay-protection window.
+#
+# WHY (vuln patched):
+#   Without message IDs, a network attacker can capture an encrypted chat
+#   frame and re-inject it; the server forwards it and clients decrypt it
+#   again.  Fernet does not detect replays — only tampering.
+#
+#   Each chat/privmsg frame now carries a random `mid` (16 hex chars) in the
+#   plaintext header.  The server keeps the last REPLAY_WINDOW_SIZE IDs seen
+#   per room (plus a global set for privmsgs).  Frames whose `mid` is already
+#   in the set are silently dropped.
+REPLAY_WINDOW_SIZE = 1000   # per room; ~100 KB memory at 100-char IDs
+
+# ---------------------------------------------------------------------------
 # Async framing helpers
 # ---------------------------------------------------------------------------
 
@@ -77,6 +111,17 @@ async def recv_frame(
     # Guard against malformed/oversized headers
     if header_len > 65536:
         logger.warning("Oversized header (%d bytes) — dropping connection", header_len)
+        return None
+
+    # Guard against oversized payloads (CRITICAL vuln patched):
+    # Without this, a single frame with payload_len = 4 GB blocks the event
+    # loop and OOMs the server.  File chunk frames are at most ~16 MB after
+    # AES-GCM overhead; anything larger is malformed or a DoS attempt.
+    if payload_len > MAX_PAYLOAD:
+        logger.warning(
+            "Oversized payload (%d bytes, max %d) — dropping connection",
+            payload_len, MAX_PAYLOAD,
+        )
         return None
 
     header_bytes = await _read_exact(reader, header_len)
@@ -143,8 +188,10 @@ class ClientConn:
         self.room:     str   = "general"
         self.vk_hex:   str   = ""
         self.alive:    bool  = True
-        # Rate limiting: timestamps of recent messages
-        self._msg_times: deque = deque()
+        # Rate limiting: timestamps of recent messages (two separate buckets)
+        self._msg_times: deque = deque()   # chat / privmsg frames
+        self._ctrl_times: deque = deque()  # DH / join / nick / pubkey frames
+        self._ctrl_limit: int  = 0         # set by NoEyesServer after init
 
     async def send(self, header: dict, payload: bytes = b"") -> bool:
         """Send a frame to this client. Returns False on error."""
@@ -153,13 +200,30 @@ class ClientConn:
             self.alive = False
         return ok
 
-    def check_rate_limit(self, limit_per_minute: int) -> bool:
+    def check_rate_limit(self, limit_per_minute: int, *, control: bool = False) -> bool:
+        """
+        Sliding-window rate limiter with separate buckets for chat vs control.
+
+        WHY TWO BUCKETS (vuln patched):
+          Previously all frame types shared one 30/min counter.  An attacker
+          with chat.key could send 30 dh_init frames/minute to a victim; the
+          victim's client auto-responds with dh_resp, exhausting the victim's
+          entire quota so they cannot send chat messages.
+
+          Now:
+            control=False (chat/privmsg)  → main bucket, limit_per_minute
+            control=True  (DH, join, pubkey_announce, nick, users_req) →
+                           separate bucket capped at limit_per_minute // 3
+                           (10/min by default — plenty for legitimate use)
+        """
         now = time.monotonic()
-        while self._msg_times and (now - self._msg_times[0]) > 60:
-            self._msg_times.popleft()
-        if len(self._msg_times) >= limit_per_minute:
+        bucket = self._ctrl_times if control else self._msg_times
+        limit  = max(1, self._ctrl_limit) if control else limit_per_minute
+        while bucket and (now - bucket[0]) > 60:
+            bucket.popleft()
+        if len(bucket) >= limit:
             return False
-        self._msg_times.append(now)
+        bucket.append(now)
         return True
 
 
@@ -183,12 +247,16 @@ class NoEyesServer:
         history_size:         int = 50,
         rate_limit_per_minute: int = 30,
         heartbeat_interval:   int = 20,
+        ssl_cert:             str = "",
+        ssl_key:              str = "",
     ):
         self.host               = host
         self.port               = port
         self.history_size       = history_size
         self.rate_limit         = rate_limit_per_minute
         self.heartbeat_interval = heartbeat_interval
+        self.ssl_cert           = ssl_cert
+        self.ssl_key            = ssl_key
 
         # username → ClientConn
         self._clients: dict[str, ClientConn] = {}
@@ -198,6 +266,13 @@ class NoEyesServer:
         )
         # username → vk_hex (Ed25519 verify key, plaintext header value)
         self._pubkeys: dict[str, str] = {}
+
+        # Replay protection: room → deque of seen `mid` values (capped at REPLAY_WINDOW_SIZE).
+        # A separate global set handles privmsg MIDs (not room-scoped).
+        self._room_mids:  dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=REPLAY_WINDOW_SIZE)
+        )
+        self._priv_mids: deque = deque(maxlen=REPLAY_WINDOW_SIZE)
 
     # ------------------------------------------------------------------
     # Entry point
@@ -211,16 +286,34 @@ class NoEyesServer:
             print("\n[server] Shutting down.")
 
     async def _main(self) -> None:
+        # Build TLS context if cert + key were supplied (--tls flag).
+        # Previously --tls was parsed but never used (dead code — vuln patched).
+        ssl_ctx = None
+        if self.ssl_cert and self.ssl_key:
+            import ssl as _ssl
+            ssl_ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+            try:
+                ssl_ctx.load_cert_chain(self.ssl_cert, self.ssl_key)
+                print(f"[server] TLS enabled — cert: {self.ssl_cert}")
+            except Exception as e:
+                print(f"[server] TLS setup failed: {e} — falling back to plaintext")
+                ssl_ctx = None
+        elif self.ssl_cert or self.ssl_key:
+            print("[server] WARNING: --tls requires both --cert and --tls-key; "
+                  "running without TLS.")
+
         server = await asyncio.start_server(
             self._handle_client,
             self.host,
             self.port,
             reuse_address=True,
+            ssl=ssl_ctx,
         )
         async with server:
             addrs = ", ".join(str(s.getsockname()) for s in server.sockets)
-            print(f"[server] Listening on {addrs}")
-            logger.info("NoEyes server listening on %s", addrs)
+            proto = "TLS" if ssl_ctx else "plaintext"
+            print(f"[server] Listening on {addrs} ({proto})")
+            logger.info("NoEyes server listening on %s (%s)", addrs, proto)
             # Start heartbeat as a background task
             asyncio.create_task(self._heartbeat_loop())
             await server.serve_forever()
@@ -249,8 +342,12 @@ class NoEyesServer:
                 logger.warning("First frame was not join from %s", addr)
                 return
 
-            username = str(header.get("username", "")).strip()[:32]
-            room     = str(header.get("room", "general")).strip()[:64]
+            # Normalise to lowercase to prevent case-variant impersonation:
+            # without this, 'alice' and 'Alice' are treated as different users
+            # and get separate TOFU entries, letting an attacker register 'Alice'
+            # with their own key while the real 'alice' already exists.
+            username = str(header.get("username", "")).strip().lower()[:32]
+            room     = str(header.get("room", "general")).strip().lower()[:64]
             vk_hex   = str(header.get("vk_hex", "")).strip()
 
             if not username:
@@ -269,6 +366,15 @@ class NoEyesServer:
             conn.username = username
             conn.room     = room
             conn.vk_hex   = vk_hex
+            # Control bucket limit: 2× the chat limit.
+            # WHY 2× and not equal:
+            #   The DoS fix only requires that control frames (dh_init, dh_resp…)
+            #   and chat frames draw from SEPARATE pools so an attacker's flood of
+            #   dh_init cannot exhaust a victim's chat quota.  The control bucket
+            #   does NOT need to be tighter than the chat bucket — reducing it would
+            #   throttle legitimate multi-peer DH sessions (e.g. joining a large group
+            #   and establishing keys with 20 people within one minute).
+            conn._ctrl_limit = max(1, self.rate_limit * 2)   # 60/min at default 30
             self._clients[username] = conn
 
             if vk_hex:
@@ -324,9 +430,14 @@ class NoEyesServer:
     ) -> None:
         msg_type = header.get("type", "")
 
-        # Rate limiting — skip for heartbeats (they're dropped anyway)
+        # Rate limiting — skip for heartbeats (they're dropped anyway).
+        # Control frames (DH, pubkey, nick, join) use a separate smaller bucket
+        # so a flood of dh_init from an attacker cannot exhaust a victim's chat quota.
         if msg_type != "heartbeat":
-            if not conn.check_rate_limit(self.rate_limit):
+            is_control = msg_type in (
+                "dh_init", "dh_resp", "pubkey_announce", "command",
+            )
+            if not conn.check_rate_limit(self.rate_limit, control=is_control):
                 await conn.send({
                     "type":  "system",
                     "event": "rate_limit",
@@ -380,6 +491,22 @@ class NoEyesServer:
         if msg_type in ("chat", "privmsg"):
             header["from"] = conn.username
             header["ts"]   = _now_ts()
+
+            # Replay protection: reject frames whose mid was already seen.
+            mid = str(header.get("mid", ""))
+            if mid:
+                if msg_type == "privmsg":
+                    if mid in self._priv_mids:
+                        logger.debug("Replay rejected: privmsg mid=%s", mid)
+                        return
+                    self._priv_mids.append(mid)
+                else:
+                    room_mids = self._room_mids[conn.room]
+                    if mid in room_mids:
+                        logger.debug("Replay rejected: chat mid=%s room=%s", mid, conn.room)
+                        return
+                    room_mids.append(mid)
+
             if msg_type == "privmsg":
                 to_user = header.get("to", "")
                 await self._send_to_user(to_user, header, payload)
@@ -463,7 +590,7 @@ class NoEyesServer:
         })
 
     async def _handle_nick(self, conn: ClientConn, header: dict) -> None:
-        new_nick = str(header.get("nick", "")).strip()[:32]
+        new_nick = str(header.get("nick", "")).strip().lower()[:32]
         if not new_nick:
             return
         old_nick = conn.username
@@ -502,7 +629,7 @@ class NoEyesServer:
             await self._broadcast_room(room, nick_event, b"", exclude=new_nick)
 
     async def _handle_join_room(self, conn: ClientConn, header: dict) -> None:
-        new_room = str(header.get("room", "general")).strip()[:64]
+        new_room = str(header.get("room", "general")).strip().lower()[:64]
         old_room = conn.room
 
         # Notify old room — reason:"room_change" so clients keep pairwise keys

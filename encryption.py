@@ -25,6 +25,7 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
@@ -64,7 +65,6 @@ def derive_room_fernet(master_fernet_key: bytes, room: str) -> Fernet:
 
     Uses HKDF-SHA256: input_key_material=master_key, info=b"room:"+room_name.
     """
-    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
     hkdf = HKDF(
         algorithm=hashes.SHA256(),
         length=32,
@@ -116,27 +116,105 @@ def generate_identity() -> tuple[bytes, bytes]:
     return sk_bytes, vk_bytes
 
 
+def _prompt_identity_password(confirm: bool = False) -> str:
+    """
+    Prompt for the identity file password on the terminal.
+
+    confirm=True  → first run: ask twice, require match.
+    confirm=False → subsequent runs: single prompt.
+
+    Returns empty string if stdin is not a real TTY (e.g. automated test,
+    pipe, or subprocess) so the caller treats it as "no encryption".
+    """
+    import sys
+    from getpass import getpass
+
+    # Don't hang in non-interactive contexts (subprocesses, CI, pipes).
+    if not sys.stdin.isatty():
+        return ""
+
+    if confirm:
+        print(
+            "\n[identity] No identity file found — creating a new one.\n"
+            "  Set a password to encrypt it (recommended),\n"
+            "  or press Enter to skip (key stored as plain text)."
+        )
+        while True:
+            pw  = getpass("  Identity password: ")
+            pw2 = getpass("  Confirm password:  ")
+            if pw == pw2:
+                return pw
+            print("  Passwords do not match — try again.")
+    else:
+        return getpass("[identity] Identity password: ")
+
+
 def load_identity(path: str) -> tuple[bytes, bytes]:
     """
-    Load an Ed25519 identity from *path* (JSON: {sk_hex, vk_hex}).
-    Creates a new identity if the file does not exist.
+    Load an Ed25519 identity from *path*.
+    Creates a new identity (with optional password protection) if not found.
+
+    On first run:
+      Prompts the user to set an identity password.  If they press Enter the
+      key is stored in plain text (backward-compatible).  If they set a
+      password the key is Fernet-encrypted before being written to disk.
+
+    On subsequent runs:
+      If the file is encrypted, prompts once for the password to unlock it.
+      If the password is wrong, exits with a clear error message.
+      If the file is plain text, loads it silently (no prompt).
 
     Returns (sk_bytes, vk_bytes).
     """
     p = Path(path).expanduser()
+
     if p.exists():
         data = json.loads(p.read_text())
-        sk_bytes = bytes.fromhex(data["sk_hex"])
         vk_bytes = bytes.fromhex(data["vk_hex"])
-        return sk_bytes, vk_bytes
-    # First run — generate and persist
+
+        if data.get("encrypted"):
+            # File is password-protected — prompt until correct or user gives up
+            import sys
+            for attempt in range(3):
+                id_pass = _prompt_identity_password(confirm=False)
+                enc_fernet = derive_fernet_key(id_pass)
+                try:
+                    sk_bytes = enc_fernet.decrypt(data["sk_enc"].encode())
+                    return sk_bytes, vk_bytes
+                except Exception:
+                    remaining = 2 - attempt
+                    if remaining:
+                        print(f"[identity] Wrong password — {remaining} attempt(s) left.")
+                    else:
+                        print("[identity] Wrong password — exiting.")
+                        sys.exit(1)
+        else:
+            # Plain-text identity (no password was set on creation)
+            sk_bytes = bytes.fromhex(data["sk_hex"])
+            return sk_bytes, vk_bytes
+
+    # ── First run ──────────────────────────────────────────────────────────
     sk_bytes, vk_bytes = generate_identity()
-    save_identity(path, sk_bytes)
+    id_pass = _prompt_identity_password(confirm=True)
+    _save_identity_with_password(path, sk_bytes, id_pass)
+    if id_pass:
+        print("[identity] New identity created and encrypted.")
+    else:
+        print("[identity] New identity created (no password — stored as plain text).")
     return sk_bytes, vk_bytes
 
 
 def save_identity(path: str, sk_bytes: bytes) -> None:
-    """Persist an Ed25519 signing key (and derive verify key) to *path*."""
+    """
+    Persist an Ed25519 signing key without a password.
+    Used internally; the public API for first-time creation goes through
+    load_identity() which prompts the user interactively.
+    """
+    _save_identity_with_password(path, sk_bytes, "")
+
+
+def _save_identity_with_password(path: str, sk_bytes: bytes, password: str) -> None:
+    """Write the identity file, optionally Fernet-encrypting the signing key."""
     p = Path(path).expanduser()
     p.parent.mkdir(parents=True, exist_ok=True)
     sk = Ed25519PrivateKey.from_private_bytes(sk_bytes)
@@ -144,7 +222,13 @@ def save_identity(path: str, sk_bytes: bytes) -> None:
         serialization.Encoding.Raw,
         serialization.PublicFormat.Raw,
     )
-    p.write_text(json.dumps({"sk_hex": sk_bytes.hex(), "vk_hex": vk_bytes.hex()}))
+    if password:
+        enc_fernet = derive_fernet_key(password)
+        sk_enc = enc_fernet.encrypt(sk_bytes).decode()
+        payload = {"encrypted": True, "sk_enc": sk_enc, "vk_hex": vk_bytes.hex()}
+    else:
+        payload = {"encrypted": False, "sk_hex": sk_bytes.hex(), "vk_hex": vk_bytes.hex()}
+    p.write_text(json.dumps(payload))
     p.chmod(0o600)
 
 
@@ -174,7 +258,6 @@ def derive_file_cipher_key(pairwise_fernet: "Fernet", transfer_id: str) -> bytes
     Derive a 32-byte AES-256-GCM key for a specific file transfer from the
     pairwise Fernet key material + transfer_id.  No extra key exchange needed.
     """
-    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
     ikm = pairwise_fernet._signing_key + pairwise_fernet._encryption_key
     return HKDF(
         algorithm=hashes.SHA256(), length=32, salt=None,
@@ -235,7 +318,14 @@ def dh_derive_shared_fernet(my_priv_bytes: bytes, peer_pub_bytes: bytes) -> Fern
     priv = X25519PrivateKey.from_private_bytes(my_priv_bytes)
     peer_pub = X25519PublicKey.from_public_bytes(peer_pub_bytes)
     shared_secret = priv.exchange(peer_pub)
-    # KDF: SHA-256 of the raw shared secret
-    key_material = hashlib.sha256(shared_secret).digest()
+    # KDF: HKDF-SHA256 — consistent with the rest of the codebase.
+    # (Previously used raw sha256() which is not a proper KDF; patched.)
+    # Both sides must use the same info label to arrive at identical keys.
+    key_material = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=b"noeyes_pairwise_v1",
+    ).derive(shared_secret)
     fernet_key = base64.urlsafe_b64encode(key_material)
     return Fernet(fernet_key)
