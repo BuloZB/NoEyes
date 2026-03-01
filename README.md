@@ -40,7 +40,7 @@ NoEyes is a Python terminal chat tool for small groups who want real privacy. Un
 | **Decrypt animation** | Cipher-text wave animation as messages decrypt |
 | **Thread-safe input** | Incoming messages never clobber what you are typing |
 | **Auto-reconnect** | Reconnects on drop, not on intentional `/quit` |
-| **21 acceptance tests** | Full selftest suite covering all major scenarios |
+| **28 acceptance tests** | Full selftest suite covering all major scenarios |
 
 ---
 
@@ -132,6 +132,8 @@ Share that connect command with anyone — works from anywhere, any network, any
 | `/msg <user> <text>` | Send an E2E-encrypted private message (auto-DH on first use) |
 | `/send <user> <file>` | Send an encrypted file of any size |
 | `/anim on\|off` | Toggle the decrypt animation |
+| `/whoami` | Show your username and key fingerprint |
+| `/trust <user>` | Clear stored key for a user who regenerated their identity |
 
 ---
 
@@ -170,7 +172,7 @@ chat.key (shared secret)
 X25519 DH (per pair, automatic on first /msg)
     alice_ephemeral + bob_ephemeral ──► shared_secret
                                              │
-                                        SHA-256
+                                        HKDF
                                              │
                                       pairwise_key   (private messages)
                                              │
@@ -190,7 +192,7 @@ NoEyes/
 ├── identity.py     — Ed25519 keypair generation and TOFU pubkey store
 ├── utils.py        — Terminal output, ANSI colors, decrypt animation, thread-safe input
 ├── config.py       — Configuration loading and CLI parsing
-├── selftest.py     — 21-check automated acceptance test suite
+├── selftest.py     — 28-check automated acceptance test suite
 ├── CHANGELOG.md    — Version history
 └── README.md
 ```
@@ -206,7 +208,7 @@ Each room has its own key: `HKDF(master_key, room_name)`. Knowing `chat.key` alo
 ### Private `/msg`
 
 1. On first `/msg`, an X25519 DH handshake runs automatically. DH public keys travel inside group-encrypted payloads — the server cannot inspect them.
-2. Both sides derive a shared Fernet key: `SHA-256(X25519_shared_secret)`.
+2. Both sides derive a shared Fernet key via `HKDF(X25519_shared_secret, info=b"noeyes_pairwise_v1")`.
 3. Message body: `{text, username, ts, sig}` — `sig` is an Ed25519 signature over the plaintext.
 4. Body encrypted with the pairwise Fernet key.
 5. Receiver verifies the signature against the TOFU store before display.
@@ -241,6 +243,7 @@ Each room has its own key: `HKDF(master_key, room_name)`. Knowing `chat.key` alo
 | Server | Blind forwarder | Zero decryption — proven by selftest Tests 2 and 5 |
 | Room isolation | `HKDF(master_key, room_name)` | Rooms are cryptographically isolated |
 | Socket safety | `threading.Lock` per connection | Prevents frame interleaving under concurrent writes |
+| TOFU | First-contact key trust | Mismatch shows ⚠ warning; `/trust <user>` to resolve after key regen |
 
 **What the server learns:** who is connected, which room they are in, and the byte length and timestamp of each frame. Nothing else.
 
@@ -274,14 +277,14 @@ python selftest.py
 [PASS] Test 17d — No duplicate own msg after room switch.
 [PASS] Test 17e — No duplicate away msg after room switch.
 
-[PASS] All 21 acceptance checks passed.
+[PASS] All 28 acceptance checks passed.
 ```
 
 ---
 
 ## Demo
-<script src="https://asciinema.org/a/NePYgYX5uxiHxpxw.js" id="asciicast-NePYgYX5uxiHxpxw" async="true"></script>
 
+[![asciicast](https://asciinema.org/a/jEKQCJ8yNV0FU0gM.svg)](https://asciinema.org/a/jEKQCJ8yNV0FU0gM)
 
 ---
 
@@ -311,6 +314,7 @@ python noeyes.py --server   [--port PORT] [--config PATH]
 python noeyes.py --connect HOST [--port PORT] [--username NAME]
                                 [--key PASSPHRASE | --key-file PATH]
                                 [--room ROOM] [--config PATH]
+                                [--identity-path PATH]
 
 python noeyes.py --gen-key --key-file PATH
 ```
