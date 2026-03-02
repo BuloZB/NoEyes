@@ -318,3 +318,6 @@ python noeyes.py --connect HOST [--port PORT] [--username NAME]
 
 python noeyes.py --gen-key --key-file PATH
 ```
+
+## License
+GPL v3 - See LICENSE file for details.
