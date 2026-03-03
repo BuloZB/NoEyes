@@ -30,7 +30,6 @@ NoEyes is a Python terminal chat tool for small groups who need real privacy. Un
 | **Guided launcher** | Arrow-key menu UI — no command-line experience needed |
 | **Auto dependency installer** | Detects your platform, installs what's missing, asks before changing anything |
 | **Self-updater** | One command to pull the latest version from GitHub |
-| **21 acceptance tests** | Full automated test suite covering all major scenarios |
 
 ---
 
