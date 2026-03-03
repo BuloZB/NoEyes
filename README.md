@@ -178,7 +178,6 @@ NoEyes/
 ├── install.ps1        Bootstrap for Windows PowerShell
 ├── install.bat        Bootstrap for Windows CMD
 │
-├── selftest.py        21-check automated acceptance test suite
 ├── demo2.py           Security features demo (tmux + asciinema)
 ├── selftest_demo2.py  Static analysis tests for demo2.py
 │
@@ -216,39 +215,7 @@ python update.py --check   # just check — don't change anything
 ```
 
 After updating, run `python setup.py --check` to make sure all dependencies are still satisfied.
-
 ---
-
-## Running the Tests
-
-```bash
-python selftest.py
-```
-
-```
-[PASS] Test 1   — Bob received group message
-[PASS] Test 2   — Server does NOT contain plaintext message body
-[PASS] Test 4   — Bob received private message
-[PASS] Test 5   — Server does NOT contain plaintext private message
-[PASS] Test 6   — Bob received and saved the file
-[PASS] Test 7   — Pairwise key survived room switch
-[PASS] Test 8   — /msg works after peer nick change
-[PASS] Test 9   — Simultaneous DH resolved
-[PASS] Test 10  — Reverse /msg delivered
-[PASS] Test 11  — /msg works after recipient switches room
-[PASS] Test 12  — /msg works after sender renames
-[PASS] Test 13  — All 3 queued messages delivered after DH
-[PASS] Test 14  — Cross-room nick change propagated
-[PASS] Test 15  — /msg to self rejected gracefully
-[PASS] Test 16  — DH re-established after reconnect
-[PASS] Test 17a — No duplicate on send
-[PASS] Test 17b — Own old message visible after /leave
-[PASS] Test 17c — Away message visible after /leave
-[PASS] Test 17d — No duplicate own msg after room switch
-[PASS] Test 17e — No duplicate away msg after room switch
-
-[PASS] All 21 acceptance checks passed.
-```
 
 ---
 
