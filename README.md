@@ -18,9 +18,7 @@
 
 **Install demo 2 — `python setup.py`** (guided wizard):
 
-[![asciicast](https://asciinema.org/a/bNH0MCFecbfwbhVa.svg)](https://asciinema.org/a/bNH0MCFecbfwbhVa)
-
-> *Replace `INSTALL_SH_CAST_ID` and `INSTALL_SETUP_CAST_ID` with the IDs from `asciinema upload` after recording.*
+[![asciicast](https://asciinema.org/a/33CtfifXVdPOsiVA.svg)](https://asciinema.org/a/33CtfifXVdPOsiVA)
 
 ---
 
