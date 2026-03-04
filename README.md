@@ -89,20 +89,6 @@ sh install.sh
 
 ---
 
-### 🐳 Docker
-
-```bash
-docker-compose up
-```
-
-Or manually:
-```bash
-docker build -t noeyes .
-docker run -p 5000:5000 noeyes --server --port 5000
-```
-
----
-
 ## Running NoEyes
 
 After setup, the easiest way is the guided launcher:
