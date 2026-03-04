@@ -7,6 +7,18 @@
 
 ---
 
+**Install demo 1 — `sh install.sh`** (no Python required):
+
+[![asciicast](https://asciinema.org/a/WFlG0y6hcn2X4rB6.svg)](https://asciinema.org/a/WFlG0y6hcn2X4rB6)
+
+---
+
+**Install demo 2 — `python setup.py`** (guided wizard):
+
+[![asciicast](https://asciinema.org/a/33CtfifXVdPOsiVA.svg)](https://asciinema.org/a/33CtfifXVdPOsiVA)
+
+---
+
 ## Features
 
 | Feature | Details |
