@@ -27,6 +27,205 @@ PURPLE       = "\033[35m"
 BRIGHT_WHITE = "\033[1;37m"
 
 
+# ---------------------------------------------------------------------------
+# Message tag system
+# ---------------------------------------------------------------------------
+# Senders prefix their message with !tagname to signal tone.
+# The tag travels inside the encrypted payload — the server never sees it.
+# Receivers use the tag to color the message and play a notification sound.
+# Everything is opt-in and silent for normal untagged messages.
+
+TAGS = {
+    "ok":     {"label": "✔ OK",     "color": "[92m",  "bold": True,  "sound": "ok"},
+    "warn":   {"label": "⚡ WARN",  "color": "[93m",  "bold": True,  "sound": "warn"},
+    "danger": {"label": "☠ DANGER","color": "[91m",  "bold": True,  "sound": "danger"},
+    "info":   {"label": "ℹ INFO",   "color": "[94m",  "bold": False, "sound": "info"},
+    "req":    {"label": "↗ REQ",    "color": "[95m",  "bold": False, "sound": "req"},
+    "?":      {"label": "? ASK",    "color": "[96m",  "bold": False, "sound": "ask"},
+}
+TAG_NAMES = set(TAGS.keys())
+
+# Prefix a user types to tag a message, e.g.  !danger server is down
+TAG_PREFIX = "!"
+
+def parse_tag(text: str) -> tuple:
+    """
+    Parse optional !tag prefix from a message.
+    Returns (tag_or_None, message_text).
+    Normal messages with no tag return (None, original_text).
+    """
+    if not text.startswith(TAG_PREFIX):
+        return None, text
+    # Find end of tag word
+    space = text.find(" ", 1)
+    if space == -1:
+        word = text[1:]
+        rest = ""
+    else:
+        word = text[1:space]
+        rest = text[space + 1:]
+    if word.lower() in TAG_NAMES:
+        return word.lower(), rest.strip()
+    # Not a known tag — treat whole thing as normal message
+    return None, text
+
+
+def format_tag_badge(tag: str) -> str:
+    """Render a colored badge for a tag, e.g.  [[92m✔ OK[0m]"""
+    if not tag or tag not in TAGS:
+        return ""
+    t = TAGS[tag]
+    color = t["color"]
+    bold  = "[1m" if t["bold"] else ""
+    return f"[{bold}{color}{t['label']}[0m] "
+
+
+# ---------------------------------------------------------------------------
+# Notification sounds
+# ---------------------------------------------------------------------------
+# Sounds play in a background thread so they never block the UI.
+# Uses platform-native audio where available, falls back to terminal bell.
+
+_SOUNDS_ENABLED = True  # toggled by /notify on|off
+
+def set_sounds_enabled(val: bool) -> None:
+    global _SOUNDS_ENABLED
+    _SOUNDS_ENABLED = val
+
+def sounds_enabled() -> bool:
+    return _SOUNDS_ENABLED
+
+# Custom sounds folder — place files here to override built-in sounds.
+# Naming: <tag>.<ext>  e.g.  sounds/danger.mp3  sounds/ok.wav  sounds/warn.ogg
+# Any format your OS player supports works.  Falls back to built-in tones.
+_SOUNDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds")
+_SOUND_EXTS  = (".wav", ".mp3", ".ogg", ".aiff", ".flac", ".m4a")
+
+def _find_custom_sound(sound_type: str):
+    """Return path to a custom sound file for *sound_type*, or None."""
+    if not os.path.isdir(_SOUNDS_DIR):
+        return None
+    for ext in _SOUND_EXTS:
+        p = os.path.join(_SOUNDS_DIR, sound_type + ext)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def play_notification(sound_type: str) -> None:
+    """Play a non-blocking notification sound for the given tag type.
+
+    Custom sounds: drop files into a  sounds/  folder next to noeyes.py.
+    Name them after the tag: ok.wav, danger.mp3, warn.ogg, info.wav,
+    req.wav, ask.wav, normal.wav.  Any format your OS player supports works.
+    Built-in tones are used as fallback when no custom file is found.
+    """
+    if not _SOUNDS_ENABLED:
+        return
+    if not _is_tty():
+        return
+
+    def _play():
+        import subprocess, sys as _sys
+        plat = _sys.platform
+
+        # ── 1. Custom sound file (highest priority) ───────────────────────────
+        custom = _find_custom_sound(sound_type)
+        if custom:
+            try:
+                if plat == "darwin":
+                    subprocess.run(["afplay", custom], capture_output=True, timeout=10)
+                    return
+                elif plat == "win32":
+                    import winsound as _ws
+                    if custom.lower().endswith(".wav"):
+                        _ws.PlaySound(custom, _ws.SND_FILENAME)
+                    else:
+                        subprocess.run(
+                            ["wmplayer", "/play", "/close", custom],
+                            capture_output=True, timeout=10,
+                        )
+                    return
+                else:
+                    for player in ("paplay", "aplay", "mpg123", "ffplay", "afplay"):
+                        if subprocess.run(
+                            ["which", player], capture_output=True
+                        ).returncode == 0:
+                            subprocess.run(
+                                [player, custom], capture_output=True, timeout=10
+                            )
+                            return
+            except Exception:
+                pass   # custom sound failed — fall through to built-in
+
+        # ── 2. Built-in system sounds ─────────────────────────────────────────
+        try:
+            if plat == "darwin":
+                _mac = {
+                    "ok":     "/System/Library/Sounds/Ping.aiff",
+                    "warn":   "/System/Library/Sounds/Tink.aiff",
+                    "danger": "/System/Library/Sounds/Basso.aiff",
+                    "info":   "/System/Library/Sounds/Pop.aiff",
+                    "req":    "/System/Library/Sounds/Hero.aiff",
+                    "ask":    "/System/Library/Sounds/Bottle.aiff",
+                    "normal": "/System/Library/Sounds/Funk.aiff",
+                }
+                snd = _mac.get(sound_type, _mac["normal"])
+                if os.path.exists(snd):
+                    subprocess.run(["afplay", snd], capture_output=True, timeout=3)
+                    return
+            elif plat == "win32":
+                import winsound as _ws
+                _win = {
+                    "ok":     (880, 120), "warn":   (440, 280),
+                    "danger": (220, 500), "info":   (660, 100),
+                    "req":    (550, 180), "ask":    (770, 130),
+                    "normal": (440,  80),
+                }
+                freq, dur = _win.get(sound_type, (440, 80))
+                _ws.Beep(freq, dur)
+                return
+            else:
+                import wave, struct, tempfile, math
+                _linux = {
+                    "ok":     (880, 0.15), "warn":   (440, 0.28),
+                    "danger": (220, 0.45), "info":   (660, 0.10),
+                    "req":    (550, 0.18), "ask":    (770, 0.13),
+                    "normal": (440, 0.08),
+                }
+                freq, dur = _linux.get(sound_type, (440, 0.08))
+                rate = 22050; n = int(rate * dur)
+                data = b"".join(
+                    struct.pack("<h", int(32767 * math.sin(
+                        2 * math.pi * freq * i / rate
+                    ) * max(0, 1 - i / n)))
+                    for i in range(n)
+                )
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                    fname = f.name
+                    with wave.open(f, "w") as wf:
+                        wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(rate)
+                        wf.writeframes(data)
+                for player in ("paplay", "aplay", "afplay"):
+                    if subprocess.run(["which", player], capture_output=True).returncode == 0:
+                        subprocess.run([player, fname], capture_output=True, timeout=3)
+                        break
+                os.unlink(fname)
+                return
+        except Exception:
+            pass
+
+        # ── 3. Terminal bell fallback ─────────────────────────────────────────
+        _bells = {
+            "ok": "", "warn": "", "danger": "",
+            "info": "", "req": "", "ask": "", "normal": "",
+        }
+        for b in _bells.get(sound_type, ""):
+            _sys.stdout.write(b); _sys.stdout.flush(); time.sleep(0.12)
+
+    threading.Thread(target=_play, daemon=True).start()
+
+
 def _is_tty() -> bool:
     try:
         return os.isatty(sys.stdout.fileno())
@@ -541,15 +740,503 @@ def _run_animation(prefix: str, plaintext: str) -> None:
     sys.stdout.flush()
 
 
+# ---------------------------------------------------------------------------
+# Katana Zero word animation engine — fully automatic, no user markup needed
+# ---------------------------------------------------------------------------
+# Tag sets the animation rhythm (speed per word).
+# Each word is independently classified by the engine and gets its own color.
+# Both layers apply simultaneously: tag = speed, word detection = color.
+#
+# Word classifications (auto-detected, no syntax needed from user):
+#   ALL CAPS          → shout    — instant red pop
+#   word...           → trailing — dim grey, slow fade-in
+#   @mention          → mention  — bright cyan highlight
+#   number/digit      → number   — slightly emphasized white
+#   intensifier       → intense  — bold bright white
+#   happy/positive    → happy    — bright green
+#   angry/urgent      → angry    — bright red/orange
+#   sad/low-energy    → sad      — dim blue
+#   surprised/shocked → shocked  — bright yellow flash
+#   question word     → question — cyan
+#   normal            → normal   — default terminal color
+# ---------------------------------------------------------------------------
+
+# ── Word emotion dictionaries ─────────────────────────────────────────────────
+
+_HAPPY_WORDS = {
+    # joy / excitement
+    "great","love","perfect","nice","good","awesome","excellent","amazing",
+    "wonderful","fantastic","happy","joy","best","beautiful","brilliant",
+    "superb","outstanding","incredible","magnificent","glorious","splendid",
+    "delightful","marvelous","exceptional","extraordinary","terrific",
+    # social / gratitude
+    "congrats","congratulations","thanks","thank","appreciate","proud",
+    "grateful","thankful","blessed","honored","respect","welcome","cheers",
+    "bravo","kudos","legend","goat","elite","fire","lit","based",
+    # success / achievement
+    "win","won","success","victory","achieved","done","completed","finished",
+    "solved","fixed","working","shipped","deployed","released","launched",
+    "passed","approved","accepted","confirmed","verified","valid","clean",
+    # positive vibes
+    "yes","yay","cool","sweet","glad","pleased","excited","enjoy","fun",
+    "laugh","smile","cheerful","positive","hope","hype","hyped","lets","letsgo",
+    "nice","dope","sick","goated","smooth","solid","crisp","clean","fresh",
+    "perfect","flawless","easy","ez","gg","poggers","pog","lol","haha",
+    "hahaha","lmao","lmfao","rofl","xd",
+}
+
+_ANGRY_WORDS = {
+    # frustration / failure
+    "hate","wrong","broken","stop","bad","terrible","awful","horrendous",
+    "atrocious","dreadful","pathetic","garbage","trash","rubbish","junk",
+    "useless","worthless","pointless","stupid","dumb","idiotic","braindead",
+    "fail","failed","failure","failing","crash","crashed","crashing","bug",
+    "bugs","buggy","error","errors","glitch","glitches","corrupt","corrupted",
+    "problem","problems","issue","issues","disaster","catastrophe","mess",
+    # urgency
+    "urgent","asap","immediately","critical","emergency","priority","now",
+    "broken","offline","down","dead","stuck","blocked","denied","rejected",
+    "banned","suspended","terminated","deleted","lost","missing","gone",
+    # anger words
+    "unacceptable","ridiculous","absurd","outrageous","disgusting","pathetic",
+    "infuriating","maddening","enraging","infuriated","furious","rage","angry",
+    "mad","livid","outraged","annoyed","irritated","frustrated","pissed",
+    "annoying","irritating","frustrating","impossible","unbearable","intolerable",
+    "horrible","worst","terrible","awful","disgusting","revolting","appalling",
+    # curse words
+    "fuck","fucked","fucking","fucker","fucks","motherfucker","mf",
+    "shit","shitty","bullshit","bs","horseshit","shitstorm",
+    "damn","dammit","damned","goddamn","goddammit",
+    "ass","asshole","asshat","jackass","smartass","dumbass","dipshit",
+    "bitch","bitching","bitchy","son","bastard",
+    "crap","crapload","crappy",
+    "hell","wtf","stfu","gtfo","kys","ffs","smh",
+    "idiot","moron","imbecile","buffoon","clown","loser","creep",
+    "screw","screwed","piss","pissy","hate","detests",
+}
+
+_SAD_WORDS = {
+    # core sadness
+    "sorry","sad","hurt","miss","lost","gone","alone","lonely","isolated",
+    "abandoned","rejected","unloved","unwanted","invisible","forgotten",
+    "tired","exhausted","drained","burnt","burnout","depleted","empty",
+    "numb","hollow","broken","shattered","crushed","devastated","destroyed",
+    # emotional distress
+    "disappointed","heartbroken","grief","grieving","mourning","depressed",
+    "depression","anxious","anxiety","hopeless","helpless","worthless",
+    "useless","failure","loser","pathetic","weak","fragile","vulnerable",
+    # regret / apology
+    "unfortunately","regret","regrets","regretful","wish","wished","mistake",
+    "mistakes","oops","apologize","apologies","apology","pardon","forgive",
+    "forgiveness","blame","fault","guilty","shame","ashamed","embarrassed",
+    # difficulty
+    "afraid","scared","terrified","frightened","worried","worrying","concern",
+    "concerned","nervous","stressed","stress","struggling","struggle","suffer",
+    "suffering","pain","painful","agony","miserable","misery","cry","crying",
+    "tears","weeping","aching","difficult","hard","tough","rough","dark",
+}
+
+_SHOCKED_WORDS = {
+    # disbelief
+    "wait","what","wow","omg","wtf","wth","omfg","seriously","really",
+    "actually","literally","honest","honestly","genuinely","truly","really",
+    "impossible","unbelievable","unreal","unthinkable","inconceivable",
+    "incredible","shocking","shocking","stunned","speechless","mindblown",
+    "unexpected","sudden","suddenly","overnight","instantly","immediately",
+    # reactions
+    "whoa","woah","damn","holy","insane","crazy","wild","nuts","bonkers",
+    "absurd","surreal","bizarre","weird","strange","odd","peculiar",
+    "no","nope","nah","no way","never","wut","huh","eh","uh","um","hmm",
+    "bruh","bro","dude","man","yo","ayo","oi","oof","yikes","sheesh",
+    "dayum","dayumn","geez","gosh","dang","shoot","snap","crikey",
+}
+
+# Only true interrogative words — not auxiliary verbs
+_QUESTION_WORDS = {
+    "who","what","why","when","how","where","which","whose","whom",
+    "whatever","whoever","whenever","wherever","however","whichever",
+}
+
+_INTENSIFIERS = {
+    # degree
+    "very","extremely","absolutely","completely","totally","utterly","fully",
+    "entirely","wholly","perfectly","purely","quite","rather","fairly",
+    "terribly","awfully","dreadfully","frightfully","incredibly","remarkably",
+    "especially","particularly","specifically","notably","significantly",
+    "highly","deeply","strongly","heavily","seriously","severely","badly",
+    # certainty
+    "definitely","certainly","surely","undoubtedly","unquestionably","clearly",
+    "obviously","evidently","apparently","plainly","simply","just","literally",
+    "basically","essentially","fundamentally","really","truly","genuinely",
+    "honestly","frankly","absolutely","positively","categorically",
+    # frequency / scope
+    "always","never","forever","constantly","continuously","perpetually",
+    "everywhere","anywhere","nowhere","everything","anything","nothing",
+    "everyone","anyone","nobody","somebody","all","none","every","each",
+}
+
+_EXCITED_WORDS = {
+    "hype","hyped","fire","lit","banger","letsgo","lets","go","poggers","pog",
+    "insane","crazy","wild","nuts","epic","legendary","goated","peak","based",
+    "bussin","slaps","bop","heat","flames","absolute","unit","beast","god",
+    "cracked","nasty","filthy","dirty","clean","crispy","crisp","smooth",
+    "unstoppable","unreal","unmatched","untouchable","dominant","obliterated",
+    "destroyed","clapped","rekt","bodied","demolished","annihilated","carried",
+    "popping","popped","banging","slapping","hitting","going","going","off",
+    "vibrating","vibing","vibes","energy","surge","rush","boost","turbo",
+    "max","maxed","full","send","sending","sent","launched","blasted","rocket",
+    "zooming","zoomed","flying","soaring","rising","climbing","skyrocket",
+    "let","go","goo","gooo","lesgo","letsgooo","sheesh","sheeeesh","yoooo",
+}
+
+_UNCERTAIN_WORDS = {
+    "maybe","idk","dunno","probably","guess","perhaps","kinda","sorta","ish",
+    "possibly","potentially","presumably","apparently","seemingly","supposedly",
+    "roughly","approximately","around","about","almost","nearly","somewhat",
+    "kind","sort","type","like","fairly","pretty","quite","rather","relatively",
+    "might","could","would","should","may","unsure","uncertain","unclear",
+    "confused","confusing","complicated","complex","ambiguous","vague","fuzzy",
+    "not sure","not certain","not clear","not sure","hard to say","depends",
+    "wondering","wonder","curious","not sure","thinking","thought","feel",
+    "suppose","suspect","reckon","imagine","assume","believe","think",
+}
+
+_THREAT_WORDS = {
+    "careful","watch","beware","risk","danger","caution","avoid","warning",
+    "alert","alarm","hazard","threat","menace","peril","jeopardy","crisis",
+    "critical","severe","extreme","high","elevated","imminent","incoming",
+    "suspicious","suspect","shady","sketchy","fishy","off","wrong","bad",
+    "malicious","malware","virus","hack","hacked","breach","compromised",
+    "leaked","exposed","vulnerable","attack","attacked","attacking","exploit",
+    "phishing","scam","fraud","fake","spoofed","hijacked","targeted","pwned",
+    "stay","heads","up","watch","out","look","out","be","careful","dont",
+    "never","trust","verify","check","double","check","confirm","validate",
+}
+
+_TIMEPRESSURE_WORDS = {
+    "deadline","late","overdue","today","tonight","tomorrow","asap","now",
+    "urgent","immediately","soon","quickly","fast","hurry","rush","sprint",
+    "yesterday","due","past","due","missed","delayed","behind","schedule",
+    "running","out","time","clock","ticking","countdown","expire","expiring",
+    "expired","timeout","timeouts","cutoff","last","chance","final","closing",
+    "end","ends","ending","closing","close","almost","nearly","minutes","hours",
+    "seconds","deadline","crunch","pressure","pending","waiting","overdue",
+    "morning","afternoon","evening","midnight","noon","eod","eow","eom",
+}
+
+_SOCIAL_WORDS = {
+    "bro","bruh","yo","dude","man","guys","everyone","team","hey","ayo",
+    "fam","homie","homies","crew","squad","gang","people","folks","peeps",
+    "friend","friends","buddy","mate","pal","partner","colleague","boss",
+    "sir","ma","madam","chief","captain","boss","king","queen","legend",
+    "brother","sister","sibling","cousin","neighbor","stranger","person",
+    "yall","ya'll","u","ur","you","your","yours","yourself","yourselves",
+    "them","they","those","these","we","us","our","ours","ourselves","i",
+}
+
+_AGREEMENT_WORDS = {
+    "yes","yep","yup","yeah","yah","ya","sure","ok","okay","k","kk","ight",
+    "alright","right","correct","exactly","precisely","absolutely","definitely",
+    "roger","copy","affirmative","confirmed","understood","noted","received",
+    "gotcha","got","agreed","agree","concur","seconded","approved","accepted",
+    "valid","true","fact","facts","accurate","spot","on","nail","nailed",
+    "true","real","legit","based","solid","good","great","perfect","nice",
+    "makes","sense","fair","enough","works","fine","cool","sounds","good",
+}
+
+_DISAGREEMENT_WORDS = {
+    "no","nope","nah","negative","nay","disagree","wrong","incorrect","false",
+    "reject","denied","denied","refused","declined","rejected","vetoed",
+    "absolutely not","no way","not a chance","never","not happening","nope",
+    "invalid","inaccurate","mistaken","error","bug","issue","problem","flaw",
+    "but","however","although","though","yet","still","nevertheless","despite",
+    "except","unless","until","without","against","oppose","opposed","counter",
+    "contradict","refute","dispute","challenge","question","doubt","skeptical",
+}
+
+_GREETING_WORDS = {
+    "hi","hello","hey","howdy","hiya","sup","wassup","whatsup","what's up",
+    "greetings","salutations","good morning","good afternoon","good evening",
+    "morning","afternoon","evening","night","gm","gn","goodnight","goodmorning",
+    "bye","goodbye","cya","later","laters","ttyl","ttys","peace","out","deuces",
+    "take care","stay safe","see you","see ya","catch you","later","peaceout",
+    "farewell","adieu","adios","ciao","sayonara","toodles","cheers","seeya",
+    "wb","welcome back","welcome","back","nice to see","glad you're here",
+}
+
+# ── ANSI styles per word class ────────────────────────────────────────────────
+
+_KZ_STYLES = {
+    # original categories
+    "shout":       "[1;91m",     # bold bright red          — loud impact
+    "trailing":    "[2;90m",     # dim dark grey            — fading out
+    "mention":     "[1;95m",     # bold bright magenta      — @user highlight
+    "number":      "[38;5;214m", # amber orange             — data/value
+    "intense":     "[1;97m",     # bold bright white        — emphasis
+    "happy":       "[1;92m",     # bold bright green        — positive
+    "angry":       "[38;5;202m", # deep orange-red          — anger
+    "sad":         "[38;5;69m",  # steel blue               — melancholy
+    "shocked":     "[1;93m",     # bold bright yellow       — surprise
+    "question":    "[38;5;51m",  # bright aqua              — inquiry
+    # new categories
+    "excited":     "[38;5;213m", # hot pink/fuchsia         — hype energy
+    "uncertain":   "[38;5;245m", # medium grey              — ambiguity
+    "threat":      "[38;5;196m", # pure red (brighter)      — danger/warning
+    "timepressure":"[38;5;220m", # gold yellow              — urgency/time
+    "social":      "[38;5;159m", # light sky blue           — address/people
+    "agreement":   "[38;5;120m", # light green              — yes/confirm
+    "disagreement":"[38;5;210m", # soft red/salmon          — no/reject
+    "greeting":    "[38;5;227m", # pale yellow              — hello/bye
+    "normal":      "",               # default terminal color
+}
+
+# ── Base delay between words per tag ─────────────────────────────────────────
+
+_KZ_WORD_DELAY = {
+    "danger": 0.022,
+    "warn":   0.034,
+    "ok":     0.046,
+    "req":    0.052,
+    "ask":    0.058,
+    "info":   0.064,
+    "normal": 0.040,
+}
+
+_KZ_PUNCT_PAUSE = {".": 3.5, "!": 2.0, "?": 2.8, ",": 1.6, ";": 1.8, ":": 1.5}
+
+
+def _kz_classify(word: str) -> str:
+    """
+    Classify a single word into a KZ style category.
+    Order matters — more specific checks first.
+    """
+    import re
+    bare = word.rstrip(".,!?;:").lower()
+    raw  = word.rstrip(".,!?;:")
+
+    # Structural detections first
+    if raw == raw.upper() and len(raw) >= 2 and raw.isalpha():
+        return "shout"
+    if word.endswith("...") or word.endswith("…"):
+        return "trailing"
+    if bare.startswith("@") and len(bare) > 1:
+        return "mention"
+    if re.match(r"^-?\d[\d,.%$€£]*$", bare):
+        return "number"
+
+    # Semantic detections — order matters, more specific wins
+    if bare in _INTENSIFIERS:
+        return "intense"
+    if bare in _THREAT_WORDS:
+        return "threat"
+    if bare in _TIMEPRESSURE_WORDS:
+        return "timepressure"
+    if bare in _GREETING_WORDS:
+        return "greeting"
+    if bare in _SOCIAL_WORDS:
+        return "social"
+    if bare in _AGREEMENT_WORDS:
+        return "agreement"
+    if bare in _DISAGREEMENT_WORDS:
+        return "disagreement"
+    if bare in _EXCITED_WORDS:
+        return "excited"
+    if bare in _HAPPY_WORDS:
+        return "happy"
+    if bare in _ANGRY_WORDS:
+        return "angry"
+    if bare in _SAD_WORDS:
+        return "sad"
+    if bare in _UNCERTAIN_WORDS:
+        return "uncertain"
+    if bare in _SHOCKED_WORDS:
+        return "shocked"
+    if bare in _QUESTION_WORDS:
+        return "question"
+
+    return "normal"
+
+
+def _kz_render(word: str, style: str) -> str:
+    """Apply ANSI color for a word's style."""
+    color = _KZ_STYLES.get(style, "")
+    if not color:
+        return word
+    if style == "shout":
+        return f"{color}{word.upper()}[0m"
+    return f"{color}{word}[0m"
+
+
+def _kz_tokenize(text: str) -> list:
+    """Split text into (word, style) pairs, preserving punctuation on words.
+
+    Also strips any leftover markup syntax characters (*,_,~) that might
+    appear literally in the message so they never show on screen.
+    """
+    import re
+    # Strip any residual markup markers — *word*, _word_, ~word~, **word**
+    # These are no longer valid syntax but could appear in old messages or
+    # if someone types them literally.
+    clean = re.sub(r'\*{1,2}([^*]+)\*{1,2}', r'', text)
+    clean = re.sub(r'~([^~]+)~', r'', clean)
+    clean = re.sub(r'(?<!\w)_([^_]+)_(?!\w)', r'', clean)
+    tokens = []
+    for word in re.split(r'(\s+)', clean):
+        if not word or word.isspace():
+            continue
+        tokens.append((word, _kz_classify(word)))
+    return tokens
+
+
+def _has_kz_content(text: str) -> bool:
+    """Return True if any word in text would get a non-normal KZ style."""
+    return any(style != "normal" for _, style in _kz_tokenize(text))
+
+
+def _run_kz_animation(prefix: str, plaintext: str, tag: str = "") -> None:
+    """
+    Word-by-word cipher wave animation.
+
+    Each word runs through the same cipher wave as the full-sentence animation
+    (random chars scrolling → plaintext reveal) but word by word.
+    Emotion color is applied when the word finally reveals.
+    Tag sets the wave speed per word.
+    Shout words skip the wave and pop in instantly.
+    Trailing words use a slower wave.
+    Escape skips to full reveal immediately.
+    """
+    tokens = _kz_tokenize(plaintext)
+    if not tokens:
+        sys.stdout.write(prefix + "\n")
+        sys.stdout.flush()
+        return
+
+    if _SKIP_ANIM.is_set():
+        sys.stdout.write(prefix)
+        for i, (w, sty) in enumerate(tokens):
+            sys.stdout.write(_kz_render(w, sty))
+            if i < len(tokens) - 1:
+                sys.stdout.write(" ")
+        sys.stdout.write(RESET + "\n")
+        sys.stdout.flush()
+        return
+
+    WAVE = 4   # cipher window width per word (shorter than full-sentence wave)
+    base_char_delay = _KZ_WORD_DELAY.get(tag, _KZ_WORD_DELAY["normal"]) * 0.35
+
+    # Save cursor once — we restore to here to redraw the whole line each frame
+    sys.stdout.write("\0337" + prefix)
+    sys.stdout.flush()
+
+    revealed: list = []   # list of (word, style) already shown
+
+    def _redraw_line(word_placeholder: str = "") -> None:
+        """Restore saved cursor, rewrite prefix + revealed words + placeholder."""
+        sys.stdout.write("\0338" + RESET + prefix)
+        for i, (w, sty) in enumerate(revealed):
+            sys.stdout.write(_kz_render(w, sty))
+            sys.stdout.write(" ")
+        if word_placeholder:
+            sys.stdout.write(word_placeholder)
+        sys.stdout.flush()
+
+    def _wave_reveal_word(word: str, style: str) -> None:
+        """Run the cipher wave over a single word then snap to its colored form."""
+        n = len(word)
+        color = _KZ_STYLES.get(style, "")
+
+        # Speed modifiers per style
+        if style == "trailing":
+            delay = base_char_delay * 1.7
+        elif style in ("shout", "shocked"):
+            delay = base_char_delay * 0.3
+        elif style in ("intense", "mention"):
+            delay = base_char_delay * 0.7
+        else:
+            delay = base_char_delay
+
+        # Wave: cipher chars scroll across the word length
+        for i in range(n):
+            if _SKIP_ANIM.is_set():
+                break
+            revealed_chars = max(0, i + 1 - WAVE)
+            # already-revealed part of this word in its final color
+            prefix_part = (color + word[:revealed_chars] + RESET) if revealed_chars else ""
+            # cipher window
+            cipher_part  = "".join(
+                random.choice(_CIPHER_COLORS) + random.choice(_CIPHER_POOL) + RESET
+                for _ in range(min(WAVE, i + 1))
+            )
+            _redraw_line(prefix_part + cipher_part)
+            time.sleep(delay)
+
+        # Drain: reveal last WAVE chars
+        drain_delay = delay * 0.6
+        for k in range(max(0, n - WAVE), n):
+            if _SKIP_ANIM.is_set():
+                break
+            prefix_part = color + word[:k + 1] + RESET
+            _redraw_line(prefix_part)
+            time.sleep(drain_delay)
+
+        # Word fully revealed — add to revealed list
+        revealed.append((word, style))
+        _redraw_line()
+
+    for word, style in tokens:
+        if _SKIP_ANIM.is_set():
+            revealed.append((word, style))
+            continue
+
+        if style == "shout":
+            # Block flash then instant snap — no wave, just impact
+            _redraw_line(
+                "[1;91m" + "█" * len(word) + RESET
+            )
+            time.sleep(0.022)
+            revealed.append((word, style))
+            _redraw_line()
+            time.sleep(base_char_delay * 0.9)
+        else:
+            _wave_reveal_word(word, style)
+
+        # Natural pause on sentence-ending punctuation
+        last_char = word[-1] if word else ""
+        if last_char in _KZ_PUNCT_PAUSE and not _SKIP_ANIM.is_set():
+            pause = base_char_delay * _KZ_PUNCT_PAUSE[last_char] * 1.2
+            elapsed = 0.0
+            while elapsed < pause and not _SKIP_ANIM.is_set():
+                time.sleep(0.02)
+                elapsed += 0.02
+
+    # Final clean write — full line with all emotion colors
+    sys.stdout.write("\0338" + RESET + prefix)
+    for i, (word, style) in enumerate(_kz_tokenize(plaintext)):
+        sys.stdout.write(_kz_render(word, style))
+        if i < len(tokens) - 1:
+            sys.stdout.write(" ")
+    sys.stdout.write(RESET + "\n")
+    sys.stdout.flush()
+
+
+
 def _animate_msg(prefix: str, plaintext: str, room: str,
-                  from_user: str = "", ts: str = "") -> None:
+                  from_user: str = "", ts: str = "",
+                  tag: str = "") -> None:
     """Run animation inside the output lock, log the final text, mark seen."""
     _room_logs[room].append(prefix + plaintext)
     if from_user and ts:
         mark_seen(room, from_user, ts, plaintext)
     with _OUTPUT_LOCK:
         _erase_input_unsafe()
-        _run_animation(prefix, plaintext)
+        # Use KZ word animation when message has a tag or any word
+        # the engine would style (ALL CAPS, emotion words, @mentions etc).
+        # Fall back to cipher wave for plain untagged messages with no
+        # interesting words — keeps the original feel for simple chatter.
+        if tag or _has_kz_content(plaintext):
+            _run_kz_animation(prefix, plaintext, tag=tag)
+        else:
+            _run_animation(prefix, plaintext)
         _redraw_input_unsafe()
 
 
@@ -561,14 +1248,21 @@ def chat_decrypt_animation(
     anim_enabled: bool = True,
     room: str = "general",
     own_username: str = "",
+    tag: str = "",
 ) -> None:
     ts_part   = cgrey(f"[{msg_ts}]")
     # Own messages use YELLOW (matching what was displayed at send time).
-    # Other users use GREEN.
-    color     = YELLOW if (own_username and from_user == own_username) else GREEN
-    user_part = colorize(from_user, color, bold=True)
-    prefix    = f"{ts_part} {user_part}: "
-    rendered  = prefix + plaintext
+    # Other users use GREEN.  Tagged messages use the tag's color instead.
+    if tag and tag in TAGS:
+        color = TAGS[tag]["color"]
+        bold  = TAGS[tag]["bold"]
+    else:
+        color = YELLOW if (own_username and from_user == own_username) else GREEN
+        bold  = True
+    user_part  = colorize(from_user, color, bold=bold)
+    badge_part = format_tag_badge(tag)
+    prefix     = f"{ts_part} {user_part}: {badge_part}"
+    rendered   = prefix + plaintext
 
     # Already seen — reprint plain (no animation) so it shows in the room
     # after a screen clear / room switch.
@@ -580,9 +1274,14 @@ def chat_decrypt_animation(
     if not anim_enabled or not _is_tty():
         log_and_print(room, rendered)
         mark_seen(room, from_user, msg_ts, plaintext)
-        return
+    else:
+        _animate_msg(prefix, plaintext, room, from_user=from_user, ts=msg_ts, tag=tag)
 
-    _animate_msg(prefix, plaintext, room, from_user=from_user, ts=msg_ts)
+    # Play notification sound after printing (daemon thread — non-blocking)
+    if tag and tag in TAGS and from_user != own_username:
+        play_notification(TAGS[tag]["sound"])
+    elif not tag and from_user != own_username:
+        play_notification("normal")
 
 
 def privmsg_decrypt_animation(
@@ -593,12 +1292,14 @@ def privmsg_decrypt_animation(
     verified: bool = False,
     anim_enabled: bool = True,
     room: str = "general",
+    tag: str = "",
 ) -> None:
-    ts_part  = cgrey(f"[{msg_ts}]")
-    src_part = colorize(f"[PM from {from_user}]", CYAN, bold=True)
-    sig_part = cok("✓") if verified else cwarn("?")
-    prefix   = f"{ts_part} {src_part}{sig_part} "
-    rendered = prefix + plaintext
+    ts_part   = cgrey(f"[{msg_ts}]")
+    src_part  = colorize(f"[PM from {from_user}]", CYAN, bold=True)
+    sig_part  = cok("✓") if verified else cwarn("?")
+    badge_part = format_tag_badge(tag)
+    prefix    = f"{ts_part} {src_part}{sig_part} {badge_part}"
+    rendered  = prefix + plaintext
 
     if already_seen(room, from_user, msg_ts, plaintext):
         print_msg(rendered)   # replay — don't re-log, already in _room_logs
@@ -607,9 +1308,14 @@ def privmsg_decrypt_animation(
     if not anim_enabled or not _is_tty():
         log_and_print(room, rendered)
         mark_seen(room, from_user, msg_ts, plaintext)
-        return
+    else:
+        _animate_msg(prefix, plaintext, room, from_user=from_user, ts=msg_ts, tag=tag)
 
-    _animate_msg(prefix, plaintext, room, from_user=from_user, ts=msg_ts)
+    # Play notification sound (always for PMs — they deserve attention)
+    if tag and tag in TAGS:
+        play_notification(TAGS[tag]["sound"])
+    else:
+        play_notification("info")   # PMs always ping
 
 
 # ---------------------------------------------------------------------------

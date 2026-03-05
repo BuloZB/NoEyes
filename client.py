@@ -160,6 +160,7 @@ class NoEyesClient:
         port: int,
         username: str,
         group_fernet: Fernet,
+        group_key_bytes: bytes,
         room: str = "general",
         identity_path: str = "~/.noeyes/identity.key",
         tofu_path: str     = "~/.noeyes/tofu_pubkeys.json",
@@ -174,8 +175,10 @@ class NoEyesClient:
         # TOFU lookups and pairwise-key dictionaries use the same keys everywhere.
         self.username      = username.strip().lower()[:32]
         self.group_fernet  = group_fernet
-        # Store the raw master key bytes so we can re-derive per-room keys
-        self._master_key_bytes: bytes = group_fernet._signing_key + group_fernet._encryption_key
+        # Raw master key bytes for HKDF room-key derivation.
+        # Passed in directly so we never touch private Fernet attributes
+        # (_signing_key, _encryption_key) that are not part of the public API.
+        self._master_key_bytes: bytes = group_key_bytes
         self.room          = room.strip().lower()[:64]
         self._room_fernet: Fernet = enc.derive_room_fernet(self._master_key_bytes, self.room)
         self.identity_path = identity_path
@@ -199,6 +202,9 @@ class NoEyesClient:
         self._dh_pending: dict[str, dict] = {}
         # Pairwise Fernet: username → Fernet  (established sessions)
         self._pairwise: dict[str, Fernet] = {}
+        # Raw pairwise key bytes: username → bytes
+        # Kept separately so derive_file_cipher_key never needs private Fernet attrs.
+        self._pairwise_raw: dict[str, bytes] = {}
         # Queue of outgoing /msg text waiting for DH to complete (sender side)
         self._msg_queue: dict[str, list] = {}
         # Queued outgoing file sends waiting for DH to complete
@@ -212,9 +218,15 @@ class NoEyesClient:
         # the client's own _announce_pubkey) so without this guard the warning
         # fires twice for the same event.
         self._tofu_warned: set = set()
+        # When a TOFU mismatch fires we cache the peer's new (unverified) key here.
+        # /trust <peer> then promotes it into tofu_store immediately.
+        # Without this, /trust only deletes the old key; the new key is never stored
+        # and every future PM from that peer shows ? forever.
+        self._tofu_pending: dict[str, str] = {}
 
         # Buffer of incoming privmsg frames that arrived before pairwise key was ready
         self._privmsg_buffer: dict[str, list] = {}
+
         # In-progress incoming file transfers: transfer_id → {meta, chunks}
         self._incoming_files: dict[str, dict] = {}
 
@@ -287,19 +299,23 @@ class NoEyesClient:
                             f"      {fp[:16]}...{fp[-16:]}"
                         ))
                     elif store[key] != fp:
-                        # Fingerprint changed — warn loudly (possible MITM)
+                        # Fingerprint changed — abort immediately.
+                        # Continuing with a mismatched cert would let a MITM attacker
+                        # see all transport metadata (usernames, room names, timing).
+                        # The user must manually remove the stored fingerprint and
+                        # reconnect — this is the same model as SSH StrictHostKeyChecking.
                         utils.print_msg(utils.cerr(
                             f"[TLS WARNING] Server certificate changed for {key}!\n"
                             f"  Stored : {store[key][:16]}...{store[key][-16:]}\n"
                             f"  New    : {fp[:16]}...{fp[-16:]}\n"
-                            f"  This could be a server reinstall OR a man-in-the-middle attack.\n"
-                            f"  If you trust the new cert, delete the entry from:\n"
-                            f"    {self._tls_tofu_path}\n"
-                            f"  And reconnect."
+                            f"  Connection REFUSED — possible man-in-the-middle attack.\n"
+                            f"  If the server was legitimately reinstalled, remove the\n"
+                            f"  stored fingerprint and reconnect:\n"
+                            f"    Delete '{key}' from {self._tls_tofu_path}\n"
+                            f"  Then run NoEyes again."
                         ))
-                        # Still connected — user can decide. Don't drop the connection
-                        # automatically (would break reconnect flows). The warning
-                        # is prominent enough for the user to act.
+                        s.close()
+                        return False
                     else:
                         # Known fingerprint — silently good
                         utils.print_msg(utils.cok(
@@ -326,6 +342,11 @@ class NoEyesClient:
 
         backoff = 2
         session_start = 0.0
+
+        # CRT animation runs once before we open any connection.
+        # This means zero server traffic can arrive mid-animation.
+        utils.play_startup_animation()
+
         while True:
             if not self.connect():
                 if not self.reconnect or self._quit:
@@ -356,7 +377,7 @@ class NoEyesClient:
             # Announce our Ed25519 pubkey
             self._announce_pubkey()
 
-            utils.switch_room_display(self.room, show_banner=True)
+            utils.switch_room_display(self.room)
             self._running = True
 
             self._recv_thread  = threading.Thread(target=self._recv_loop,  daemon=True)
@@ -479,6 +500,8 @@ class NoEyesClient:
         if is_new:
             utils.print_msg(utils.cok(f"[tofu] Trusted new key for {uname} (first contact)."))
         elif not trusted:
+            # Cache new key so /trust can promote it into tofu_store immediately.
+            self._tofu_pending[uname] = vk_hex
             self._tofu_mismatched.add(uname)
             if uname not in self._tofu_warned:
                 self._tofu_warned.add(uname)
@@ -507,11 +530,14 @@ class NoEyesClient:
         """
         if peer in self._pairwise:
             if then_send:
-                self._send_privmsg_encrypted(peer, then_send[0])
+                text_q, tag_q = then_send[0], then_send[1] if len(then_send) > 1 else ""
+                self._send_privmsg_encrypted(peer, text_q, tag=tag_q)
             return
 
         if then_send:
-            self._msg_queue.setdefault(peer, []).append(then_send[0])
+            self._msg_queue.setdefault(peer, []).append(
+                (then_send[0], then_send[1] if len(then_send) > 1 else "")
+            )
 
         if peer in self._dh_pending:
             # Bug fix: if the pending handshake is stale (dh_resp never arrived,
@@ -578,9 +604,10 @@ class NoEyesClient:
         # Generate our own DH keypair for this session
         priv_bytes, pub_bytes = enc.dh_generate_keypair()
 
-        # Derive pairwise Fernet immediately
-        pairwise = enc.dh_derive_shared_fernet(priv_bytes, peer_dh_pub)
-        self._pairwise[from_user] = pairwise
+        # Derive pairwise Fernet immediately and store raw bytes alongside it
+        pairwise, p_raw = enc.dh_derive_shared_fernet(priv_bytes, peer_dh_pub)
+        self._pairwise[from_user]     = pairwise
+        self._pairwise_raw[from_user] = p_raw
         utils.print_msg(utils.cok(f"[dh] Pairwise key established with {from_user}."))
 
         # Send dh_resp
@@ -597,8 +624,8 @@ class NoEyesClient:
         # Flush any outgoing messages queued while waiting for this handshake.
         # This matters when the tiebreaker makes us the responder mid-flight:
         # we queued our own /msg in _msg_queue but _handle_dh_resp never fires for us.
-        for text in self._msg_queue.pop(from_user, []):
-            self._send_privmsg_encrypted(from_user, text)
+        for text, tag in self._msg_queue.pop(from_user, []):
+            self._send_privmsg_encrypted(from_user, text, tag=tag)
 
         # Flush queued file sends
         for filepath in self._file_queue.pop(from_user, []):
@@ -622,13 +649,14 @@ class NoEyesClient:
             return
 
         priv_bytes = self._dh_pending.pop(from_user)["priv"]
-        pairwise = enc.dh_derive_shared_fernet(priv_bytes, peer_dh_pub)
-        self._pairwise[from_user] = pairwise
+        pairwise, p_raw = enc.dh_derive_shared_fernet(priv_bytes, peer_dh_pub)
+        self._pairwise[from_user]     = pairwise
+        self._pairwise_raw[from_user] = p_raw
         utils.print_msg(utils.cok(f"[dh] Pairwise key established with {from_user}."))
 
         # Flush any queued outgoing messages
-        for text in self._msg_queue.pop(from_user, []):
-            self._send_privmsg_encrypted(from_user, text)
+        for text, tag in self._msg_queue.pop(from_user, []):
+            self._send_privmsg_encrypted(from_user, text, tag=tag)
 
         # Flush queued file sends
         for filepath in self._file_queue.pop(from_user, []):
@@ -641,14 +669,19 @@ class NoEyesClient:
     # Sending messages
     # ------------------------------------------------------------------
 
-    def _send_chat(self, text: str) -> None:
+    def _send_chat(self, text: str, tag: str = "") -> None:
         """Encrypt and broadcast a group chat message."""
-        ts   = time.strftime("%H:%M:%S")   # single capture — used in body AND mark_seen
-        body = json.dumps({
+        ts  = time.strftime("%H:%M:%S")   # single capture — used in body AND mark_seen
+        sig = enc.sign_message(self.sk_bytes, text.encode("utf-8")).hex()
+        body_dict: dict = {
             "text":     text,
             "username": self.username,
             "ts":       ts,
-        }).encode()
+            "sig":      sig,   # Ed25519 over plaintext — proves sender holds their identity key
+        }
+        if tag:
+            body_dict["tag"] = tag
+        body = json.dumps(body_dict).encode()
         payload = self._room_fernet.encrypt(body)
         header = {
             "type": "chat",
@@ -662,23 +695,26 @@ class NoEyesClient:
         utils.log_and_print(self.room, utils.format_own_message(self.username, text, ts))
         utils.mark_seen(self.room, self.username, ts, text)
 
-    def _send_privmsg_encrypted(self, peer: str, text: str) -> None:
+    def _send_privmsg_encrypted(self, peer: str, text: str, tag: str = "") -> None:
         """Send a /msg to *peer* using the established pairwise Fernet."""
         pairwise = self._pairwise.get(peer)
         if pairwise is None:
             utils.print_msg(utils.cwarn(f"[msg] No pairwise key for {peer} — queuing after DH."))
-            self._ensure_dh(peer, then_send=(text,))
+            self._ensure_dh(peer, then_send=(text, tag))
             return
 
         ts  = time.strftime("%H:%M:%S")
         sig = enc.sign_message(self.sk_bytes,
                                text.encode("utf-8")).hex()
-        body = json.dumps({
+        body_dict: dict = {
             "text":     text,
             "username": self.username,
             "ts":       ts,
             "sig":      sig,
-        }).encode()
+        }
+        if tag:
+            body_dict["tag"] = tag
+        body = json.dumps(body_dict).encode()
         payload = pairwise.encrypt(body)
 
         header = {
@@ -696,7 +732,7 @@ class NoEyesClient:
         from_user = header.get("from", "?").lower()
         try:
             body = json.loads(self._room_fernet.decrypt(payload))
-            text = body.get("text", "")
+            text   = body.get("text", "")
             msg_ts = body.get("ts", ts)
         except (InvalidToken, json.JSONDecodeError):
             utils.print_msg(utils.cwarn(
@@ -704,11 +740,40 @@ class NoEyesClient:
                 "Wrong key?"
             ))
             return
+
+        # Verify Ed25519 signature if we have a trusted key for this sender.
+        # This prevents anyone who obtained the group key from impersonating
+        # other users in group chat — the same protection privmsg already had.
+        sig_hex  = body.get("sig", "")
+        vk_hex   = self.tofu_store.get(from_user)
+        verified = False
+        if vk_hex and sig_hex:
+            try:
+                verified = enc.verify_signature(
+                    bytes.fromhex(vk_hex),
+                    text.encode("utf-8"),
+                    bytes.fromhex(sig_hex),
+                )
+            except ValueError:
+                pass
+        if not verified and vk_hex and sig_hex:
+            # Show the warning once per user per session — same guard as the
+            # SECURITY WARNING already uses (_tofu_warned).  This way you see
+            # it exactly once whether they send 1 or 100 messages before /trust.
+            _sig_warn_key = f"sig_warn_{from_user}"
+            if _sig_warn_key not in self._tofu_warned:
+                self._tofu_warned.add(_sig_warn_key)
+                utils.print_msg(utils.cwarn(
+                    f"[SECURITY] Signature FAILED for group message from {from_user} — displaying anyway."
+                ))
+
+        tag = body.get("tag", "")
         utils.chat_decrypt_animation(
             payload, text, from_user, msg_ts,
             anim_enabled=self._anim_enabled,
             room=self.room,
             own_username=self.username,
+            tag=tag,
         )
 
     def _flush_privmsg_buffer(self, from_user: str) -> None:
@@ -722,7 +787,12 @@ class NoEyesClient:
 
         pairwise = self._pairwise.get(from_user)
         if pairwise is None:
-            self._privmsg_buffer.setdefault(from_user, []).append((header, payload, ts))
+            buf = self._privmsg_buffer.setdefault(from_user, [])
+            # Simple 25-message cap — the server already enforces 25/15min per pair
+            # so legitimate traffic never hits this.  This is a last-resort safety net
+            # in case someone runs a modified server.
+            if len(buf) < 25:
+                buf.append((header, payload, ts))
             return
 
         try:
@@ -766,11 +836,13 @@ class NoEyesClient:
                 ))
 
             # Animate text privmsgs: show encrypted payload → reveal plaintext
+            tag = body.get("tag", "")
             utils.privmsg_decrypt_animation(
                 payload, text, from_user, msg_ts,
                 verified=verified,
                 anim_enabled=self._anim_enabled,
                 room=self.room,
+                tag=tag,
             )
 
     # ------------------------------------------------------------------
@@ -779,8 +851,17 @@ class NoEyesClient:
 
     def _handle_file_start(self, from_user: str, body: dict) -> None:
         tid      = body.get("transfer_id", "")
-        filename = body.get("filename", "unknown")
-        total    = body.get("total_chunks", 1)
+        # Strip all directory components — prevents path traversal attacks
+        # where a malicious sender sets filename="../../../home/user/.bashrc"
+        filename = Path(body.get("filename", "unknown")).name or "unknown"
+        # Cap total_chunks — an uncapped value lets a malicious sender set
+        # total_chunks=9999999 so the transfer never completes, leaking the
+        # temp file handle and _incoming_files entry forever.
+        # 100_000 chunks × 32 MB = ~3 TB effective max — no practical limit
+        # while still blocking the DoS attack.  Security is unaffected: each
+        # chunk is independently AES-256-GCM authenticated regardless of count.
+        _MAX_CHUNKS = 100_000
+        total    = min(int(body.get("total_chunks", 1)), _MAX_CHUNKS)
         size     = body.get("total_size", 0)
 
         # Open a temp file on disk — chunks written directly, no RAM buffer
@@ -831,7 +912,11 @@ class NoEyesClient:
         # Cache derived GCM key per transfer
         gcm_key = meta.get("gcm_key")
         if gcm_key is None:
-            gcm_key = enc.derive_file_cipher_key(pairwise, tid)
+            raw = self._pairwise_raw.get(from_user)
+            if raw is None:
+                utils.print_msg(utils.cwarn(f"[recv] No raw key for {from_user} — dropping chunk"))
+                return
+            gcm_key = enc.derive_file_cipher_key(raw, tid)
             meta["gcm_key"] = gcm_key
         try:
             raw = enc.gcm_decrypt(gcm_key, gcm_blob)
@@ -839,6 +924,9 @@ class NoEyesClient:
             utils.print_msg(utils.cwarn(f"[recv] GCM auth failed on chunk {index} from {from_user}"))
             return
 
+        # Drop chunks with index beyond total — prevents unbounded pending dict growth
+        if index >= meta["total_chunks"]:
+            return
         meta["pending"][index] = raw
         while meta["next_index"] in meta["pending"]:
             c = meta["pending"].pop(meta["next_index"])
@@ -858,6 +946,9 @@ class NoEyesClient:
         if tid not in self._incoming_files:
             return
         meta = self._incoming_files[tid]
+        # Drop out-of-range chunks — same guard as the binary path
+        if index >= meta["total_chunks"]:
+            return
         meta["pending"][index] = data
         while meta["next_index"] in meta["pending"]:
             chunk = meta["pending"].pop(meta["next_index"])
@@ -932,6 +1023,7 @@ class NoEyesClient:
                 utils.log_and_print(self.room, utils.format_system(f"{uname} has left the chat.", ts))
                 # Real disconnect — clear pairwise state so stale keys don't accumulate.
                 self._pairwise.pop(uname, None)
+                self._pairwise_raw.pop(uname, None)
                 self._dh_pending.pop(uname, None)
                 self._file_queue.pop(uname, None)
                 self._msg_queue.pop(uname, None)
@@ -944,6 +1036,8 @@ class NoEyesClient:
             # arrives with the new name but is silently dropped (not found in pending).
             if old in self._pairwise:
                 self._pairwise[new] = self._pairwise.pop(old)
+            if old in self._pairwise_raw:
+                self._pairwise_raw[new] = self._pairwise_raw.pop(old)
             if old in self._dh_pending:
                 self._dh_pending[new] = self._dh_pending.pop(old)
             if old in self._msg_queue:
@@ -991,7 +1085,9 @@ class NoEyesClient:
 
     def _process_input(self, line: str) -> None:
         if not line.startswith("/"):
-            self._send_chat(line)
+            # Parse optional !tag prefix — e.g. "!danger server is down"
+            tag, text = utils.parse_tag(line)
+            self._send_chat(text, tag=tag)
             return
 
         parts = line.split(None, 2)
@@ -1013,7 +1109,7 @@ class NoEyesClient:
             return
 
         if cmd == "/clear":
-            utils.switch_room_display(self.room, show_banner=True)
+            utils.switch_room_display(self.room)
             return
 
         if cmd == "/users":
@@ -1049,6 +1145,18 @@ class NoEyesClient:
                 utils.print_msg(utils.cinfo(f"[anim] Currently {state}. Use /anim on or /anim off."))
             return
 
+        if cmd == "/notify" and len(parts) >= 2:
+            if parts[1].lower() in ("on", "1", "yes"):
+                utils.set_sounds_enabled(True)
+                utils.print_msg(utils.cok("[notify] Notification sounds ON."))
+            elif parts[1].lower() in ("off", "0", "no"):
+                utils.set_sounds_enabled(False)
+                utils.print_msg(utils.cinfo("[notify] Notification sounds OFF."))
+            else:
+                state = "ON" if utils.sounds_enabled() else "OFF"
+                utils.print_msg(utils.cinfo(f"[notify] Currently {state}. Use /notify on or /notify off."))
+            return
+
         if cmd == "/leave":
             # Leave current room and return to general
             if self.room == "general":
@@ -1062,14 +1170,15 @@ class NoEyesClient:
 
         if cmd == "/msg" and len(parts) >= 3:
             peer = parts[1].lower()
-            text = parts[2]
+            raw  = parts[2]
             if peer == self.username:
                 utils.print_msg(utils.cwarn("[msg] Cannot send a private message to yourself."))
                 return
+            tag, text = utils.parse_tag(raw)
             if peer in self._pairwise:
-                self._send_privmsg_encrypted(peer, text)
+                self._send_privmsg_encrypted(peer, text, tag=tag)
             else:
-                self._ensure_dh(peer, then_send=(text,))
+                self._ensure_dh(peer, then_send=(text, tag))
             return
 
         if cmd == "/send" and len(parts) >= 3:
@@ -1098,15 +1207,39 @@ class NoEyesClient:
                     f"[trust] No stored key for '{peer}' — nothing to update."
                 ))
                 return
-            # Remove the stored key so the next pubkey_announce is trusted as fresh.
+            # Remove the OLD key.
             del self.tofu_store[peer]
-            id_mod.save_tofu(self.tofu_store, self.tofu_path)
+
+            # If we already received the peer's new key via pubkey_announce this
+            # session, save it now so signature verification works immediately.
+            # Without this, /trust leaves tofu_store empty; carol never re-announces
+            # and every future PM shows ? forever.
+            if peer in self._tofu_pending:
+                new_key = self._tofu_pending.pop(peer)
+                self.tofu_store[peer] = new_key
+                id_mod.save_tofu(self.tofu_store, self.tofu_path)
+                utils.print_msg(utils.cok(
+                    f"[trust] Trusted new key for '{peer}': {new_key[:24]}...\n"
+                    "  Signature verification is now active for their messages."
+                ))
+            else:
+                id_mod.save_tofu(self.tofu_store, self.tofu_path)
+                utils.print_msg(utils.cok(
+                    f"[trust] Cleared stored key for '{peer}'.\n"
+                    "  Their next key announcement will be trusted automatically."
+                ))
+
+            # Clear any stale pairwise key — the peer has a new identity keypair.
+            # If the old pairwise survived (disconnect event missed or race),
+            # alice would encrypt with K_old but carol_id2 never had that key.
+            # Clearing forces a fresh DH handshake on the next /msg.
+            self._pairwise.pop(peer, None)
+            self._pairwise_raw.pop(peer, None)
+            self._dh_pending.pop(peer, None)
+            self._privmsg_buffer.pop(peer, None)  # drop msgs buffered with old key
+
             self._tofu_mismatched.discard(peer)
             self._tofu_warned.discard(peer)
-            utils.print_msg(utils.cok(
-                f"[trust] Cleared stored key for '{peer}'.\n"
-                "  Their next key announcement will be trusted automatically."
-            ))
             return
 
         utils.print_msg(utils.cwarn(f"[warn] Unknown command: {cmd}. Type /help for help."))
@@ -1139,11 +1272,25 @@ class NoEyesClient:
         import uuid, hashlib as _hl, queue as _q, time as _t
         file_size = path.stat().st_size
         total     = max(1, (file_size + FILE_CHUNK_SIZE - 1) // FILE_CHUNK_SIZE)
+
+        # Enforce the same MAX_CHUNKS cap the receiver applies — tell the sender
+        # clearly before sending a single byte rather than silently failing mid-transfer.
+        _MAX_CHUNKS = 100_000
+        _MAX_BYTES  = _MAX_CHUNKS * FILE_CHUNK_SIZE
+        if total > _MAX_CHUNKS:
+            utils.print_msg(utils.cerr(
+                f"[send] File too large to send: {_human_size(file_size)}\n"
+                f"  Maximum supported size is {_human_size(_MAX_BYTES)} "
+                f"({_MAX_CHUNKS:,} chunks × {_human_size(FILE_CHUNK_SIZE)}).\n"
+                f"  Split the file and send it in parts."
+            ))
+            return
+
         tid       = uuid.uuid4().hex
         tid_bytes = tid.encode()
 
-        # Per-transfer AES-256-GCM key derived from pairwise Fernet — no extra handshake
-        gcm_key = enc.derive_file_cipher_key(pairwise, tid)
+        # Per-transfer AES-256-GCM key derived from raw pairwise bytes — no extra handshake
+        gcm_key = enc.derive_file_cipher_key(self._pairwise_raw[peer], tid)
 
         utils.print_msg(utils.cinfo(
             f"[send] '{path.name}' → {peer}  {_human_size(file_size)}, {total} chunk(s)"
@@ -1246,6 +1393,22 @@ Commands:
   /msg <user> <text>   Encrypted private message (auto-DH on first use).
   /send <user> <file>  Send a file (encrypted, requires established DH).
   /anim <on|off>       Toggle the decrypt animation for incoming messages.
+  /notify <on|off>     Toggle notification sounds for incoming messages.
+
+Message tags (prefix your message to signal tone — optional):
+  !ok    <msg>         ✔ Green  — success / confirmed
+  !warn  <msg>         ⚡ Yellow — heads up / caution
+  !danger <msg>        ☠ Red    — urgent / critical
+  !info  <msg>         ℹ Blue   — informational
+  !req   <msg>         ↗ Purple — request / ask a favour
+  !?     <msg>         ? Cyan   — question
+
+Inline word styling (works inside any message or tag):
+  *word*               bold emphasis — bright white
+  **word**             shout — instant red pop, uppercased
+  ~word~               faded/quiet — dim grey
+  _word_               aside — cyan
+  Mix freely: !danger server is *down* **NOW** ~check logs~
   /whoami              Show your username and key fingerprint.
   /trust <user>        Clear stored key for a user after they regenerated their
                        identity (e.g. reinstalled NoEyes), so the next key

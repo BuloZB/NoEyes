@@ -79,6 +79,19 @@ MAX_HISTORY_PAYLOAD = MAX_PAYLOAD
 #   in the set are silently dropped.
 REPLAY_WINDOW_SIZE = 1000   # per room; ~100 KB memory at 100-char IDs
 
+# Per-pair privmsg rate limit (server-enforced, clients cannot bypass).
+#
+# Token-bucket model: we keep a deque of timestamps for each (from, to) pair.
+# Before forwarding a privmsg, we drain entries older than the window, then
+# check if the count is below the limit.  The allowance refills naturally as
+# time passes — no hard reset needed, no scheduled tasks, zero CPU when idle.
+#
+# 25 messages per 15 minutes per pair is generous for legitimate pre-DH
+# buffering (DH completes in < 1 second in practice) while making a
+# flood attack 96× more expensive.
+PRIVMSG_PAIR_LIMIT  = 25     # max privmsgs from A to B in the window
+PRIVMSG_PAIR_WINDOW = 900    # seconds (15 minutes)
+
 # ---------------------------------------------------------------------------
 # Async framing helpers
 # ---------------------------------------------------------------------------
@@ -275,6 +288,14 @@ class NoEyesServer:
             lambda: deque(maxlen=REPLAY_WINDOW_SIZE)
         )
         self._priv_mids: deque = deque(maxlen=REPLAY_WINDOW_SIZE)
+
+        # Per-pair privmsg token bucket: (from, to) → deque of send timestamps.
+        # Enforces PRIVMSG_PAIR_LIMIT frames per PRIVMSG_PAIR_WINDOW seconds
+        # per sender→recipient pair.  Clients cannot bypass this — it lives on
+        # the server and the server is the blind forwarder everyone connects to.
+        # Token-bucket model: old timestamps outside the window are drained first,
+        # so the allowance refills naturally as time passes — no hard resets.
+        self._privmsg_pairs: dict[tuple, deque] = defaultdict(deque)
 
     # ------------------------------------------------------------------
     # Entry point
@@ -537,6 +558,27 @@ class NoEyesServer:
 
             if msg_type == "privmsg":
                 to_user = header.get("to", "")
+                # Server-side per-pair token bucket — clients cannot bypass this.
+                # Drain old timestamps, then check if under the limit.
+                pair   = (conn.username, to_user)
+                bucket = self._privmsg_pairs[pair]
+                now_ts = time.monotonic()
+                while bucket and (now_ts - bucket[0]) > PRIVMSG_PAIR_WINDOW:
+                    bucket.popleft()
+                if len(bucket) >= PRIVMSG_PAIR_LIMIT:
+                    logger.debug(
+                        "privmsg rate limit: %s → %s (%d/%d in %ds)",
+                        conn.username, to_user,
+                        len(bucket), PRIVMSG_PAIR_LIMIT, PRIVMSG_PAIR_WINDOW,
+                    )
+                    await conn.send({
+                        "type":    "system",
+                        "event":   "rate_limit",
+                        "message": f"Sending too fast to {to_user} — slow down.",
+                        "ts":      _now_ts(),
+                    })
+                    return
+                bucket.append(now_ts)
                 await self._send_to_user(to_user, header, payload)
             else:
                 room = header.get("room", conn.room)
@@ -696,6 +738,10 @@ class NoEyesServer:
         self._clients.pop(conn.username, None)
         conn.alive = False
         logger.info("%s disconnected", conn.username)
+        # Clean up per-pair buckets for this user so they don't accumulate forever
+        stale = [k for k in self._privmsg_pairs if conn.username in k]
+        for k in stale:
+            del self._privmsg_pairs[k]
 
         # Notify room of real disconnect (no "reason" field → client clears pairwise)
         await self._broadcast_room(conn.room, {

@@ -32,7 +32,7 @@ def _resolve_fernet(cfg: dict):
     from cryptography.fernet import Fernet
 
     if cfg.get("key_file"):
-        return enc.load_key_file(cfg["key_file"])
+        return enc.load_key_file(cfg["key_file"])  # returns (Fernet, key_bytes)
 
     passphrase = cfg.get("key")
     if not passphrase:
@@ -56,7 +56,37 @@ def _resolve_fernet(cfg: dict):
             "             python noeyes.py --connect HOST --key-file ./chat.key"
         ))
 
-    return enc.derive_fernet_key(passphrase)
+    # ── Secure key derivation ──────────────────────────────────────────────────
+    # Instead of re-deriving from the passphrase on every run (which would
+    # reuse the same static salt each time), we derive ONCE with a fresh random
+    # salt, save the result to a key file, and use the key file from then on.
+    #
+    # This means:
+    #   - Each deployment gets a unique random salt → rainbow tables are useless.
+    #   - After the first run the passphrase is no longer needed.
+    #   - Other users should receive the generated key FILE, not the passphrase.
+    #
+    # Key file is saved to --key-file path if provided, otherwise to the
+    # default location ~/.noeyes/derived.key.
+    import os as _os
+    from pathlib import Path as _Path
+
+    save_path = cfg.get("key_file") or "~/.noeyes/derived.key"
+    save_p    = _Path(save_path).expanduser()
+
+    if save_p.exists():
+        # Key file already exists from a previous run — load it directly.
+        # No PBKDF2 re-derivation, no static salt.
+        return enc.load_key_file(save_path)  # returns (Fernet, key_bytes)
+
+    # First run with this passphrase: derive key with fresh random salt and save.
+    fernet, key_bytes = enc.derive_and_save_key_file(save_path, passphrase)
+    print(utils.cok(
+        f"[keygen] Passphrase derived and saved to {save_p}\n"
+        f"         Share this file (not the passphrase) with other users:\n"
+        f"           python noeyes.py --connect HOST --key-file {save_p}"
+    ))
+    return fernet, key_bytes
 
 
 def _get_username(cfg: dict) -> str:
@@ -169,7 +199,7 @@ def _resolve_tls_for_client(host: str, port: int, no_tls: bool) -> tuple:
 def run_client(cfg: dict) -> None:
     from client import NoEyesClient
 
-    group_fernet = _resolve_fernet(cfg)
+    group_fernet, group_key_bytes = _resolve_fernet(cfg)
     username     = _get_username(cfg)
 
     no_tls = cfg.get("no_tls", False)
@@ -180,6 +210,7 @@ def run_client(cfg: dict) -> None:
         port=cfg["port"],
         username=username,
         group_fernet=group_fernet,
+        group_key_bytes=group_key_bytes,
         room=cfg["room"],
         identity_path=cfg["identity_path"],
         tofu_path=cfg["tofu_path"],

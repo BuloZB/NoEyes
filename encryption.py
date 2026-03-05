@@ -40,20 +40,34 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
 # Shared-passphrase Fernet (group chat, backward-compatible)
 # ---------------------------------------------------------------------------
 
-_PBKDF2_SALT = b"noeyes_static_salt_v1"  # fixed academic salt (as before)
-_PBKDF2_ITERATIONS = 390_000
+_PBKDF2_SALT_LEGACY = b"noeyes_static_salt_v1"  # kept for backward-compat only
+_PBKDF2_ITERATIONS   = 390_000
 
 
-def derive_fernet_key(passphrase: str) -> Fernet:
-    """Derive a Fernet instance from a shared passphrase using PBKDF2-HMAC-SHA256."""
+def derive_fernet_key(passphrase: str, salt: bytes | None = None) -> tuple:
+    """
+    Derive a Fernet instance from a shared passphrase using PBKDF2-HMAC-SHA256.
+
+    Args:
+        passphrase: the shared passphrase string
+        salt:       32 random bytes.  Pass None only for legacy backward-compat
+                    (uses the old static salt so existing deployments still work).
+                    For new deployments always pass os.urandom(32).
+
+    Returns:
+        (Fernet, salt_bytes) — the derived Fernet key and the salt that was used.
+        Callers must persist the salt alongside the key so the same key can be
+        re-derived on the next run.
+    """
+    used_salt = salt if salt is not None else _PBKDF2_SALT_LEGACY
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
         length=32,
-        salt=_PBKDF2_SALT,
+        salt=used_salt,
         iterations=_PBKDF2_ITERATIONS,
     )
     key = base64.urlsafe_b64encode(kdf.derive(passphrase.encode("utf-8")))
-    return Fernet(key)
+    return Fernet(key), used_salt
 
 
 def derive_room_fernet(master_fernet_key: bytes, room: str) -> Fernet:
@@ -75,20 +89,65 @@ def derive_room_fernet(master_fernet_key: bytes, room: str) -> Fernet:
     return Fernet(base64.urlsafe_b64encode(derived))
 
 
-def load_key_file(path: str) -> Fernet:
-    """Load a Fernet key from a key file (one URL-safe base64 line)."""
+def load_key_file(path: str) -> tuple:
+    """
+    Load a Fernet key from a key file.
+
+    Supports two formats:
+      v1 (legacy): a single URL-safe base64 line — the raw Fernet key.
+      v2 (new):    JSON {"v":2,"key":"<base64>","salt":"<hex>"}
+
+    Returns (Fernet, raw_key_bytes: bytes) so callers have both the Fernet
+    object and the raw 32-byte key material without accessing private attrs.
+    """
     p = Path(path).expanduser()
-    key = p.read_text().strip().encode()
-    return Fernet(key)
+    raw = p.read_text().strip()
+    if raw.startswith("{"):
+        data  = json.loads(raw)
+        key_b64 = data["key"].encode()
+    else:
+        key_b64 = raw.encode()
+    key_bytes = base64.urlsafe_b64decode(key_b64)
+    return Fernet(key_b64), key_bytes
 
 
 def generate_key_file(path: str) -> None:
-    """Generate a new Fernet key and write it to *path*."""
+    """Generate a new random Fernet key and write it to *path* (v1 format)."""
     p = Path(path).expanduser()
     p.parent.mkdir(parents=True, exist_ok=True)
     key = Fernet.generate_key()
     p.write_bytes(key)
+    p.chmod(0o600)
     print(f"[keygen] New Fernet key written to {p}")
+
+
+def derive_and_save_key_file(path: str, passphrase: str) -> Fernet:
+    """
+    Derive a Fernet key from *passphrase* with a fresh random salt, then save
+    it to *path* in v2 JSON format.
+
+    The derived key (not the passphrase) is stored — after this call the
+    passphrase is no longer needed.  Share the key FILE with other users, not
+    the passphrase.  Each call generates a different salt → different key, so
+    call this once per deployment then distribute the resulting file.
+
+    Returns the Fernet instance ready for use.
+    """
+    salt    = os.urandom(32)
+    raw_key = base64.urlsafe_b64encode(
+        PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=_PBKDF2_ITERATIONS,
+        ).derive(passphrase.encode("utf-8"))
+    ).decode()
+    p = Path(path).expanduser()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"v": 2, "key": raw_key, "salt": salt.hex()}))
+    p.chmod(0o600)
+    key_bytes = base64.urlsafe_b64decode(raw_key)
+    return Fernet(raw_key.encode()), key_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -255,16 +314,19 @@ def verify_signature(vk_bytes: bytes, data: bytes, sig_bytes: bytes) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def derive_file_cipher_key(pairwise_fernet: "Fernet", transfer_id: str) -> bytes:
+def derive_file_cipher_key(pairwise_key_bytes: bytes, transfer_id: str) -> bytes:
     """
     Derive a 32-byte AES-256-GCM key for a specific file transfer from the
-    pairwise Fernet key material + transfer_id.  No extra key exchange needed.
+    raw pairwise key bytes + transfer_id.  No extra key exchange needed.
+
+    Accepts raw key bytes (not a Fernet object) so we never touch private
+    Fernet attributes (_signing_key, _encryption_key) that are not part of
+    the public cryptography library API and could silently break on update.
     """
-    ikm = pairwise_fernet._signing_key + pairwise_fernet._encryption_key
     return HKDF(
         algorithm=hashes.SHA256(), length=32, salt=None,
         info=b"noeyes_file_gcm_v1:" + transfer_id.encode(),
-    ).derive(ikm)
+    ).derive(pairwise_key_bytes)
 
 
 def gcm_encrypt(key: bytes, plaintext: bytes) -> bytes:
@@ -309,20 +371,22 @@ def dh_generate_keypair() -> tuple[bytes, bytes]:
     return priv_bytes, pub_bytes
 
 
-def dh_derive_shared_fernet(my_priv_bytes: bytes, peer_pub_bytes: bytes) -> Fernet:
+def dh_derive_shared_fernet(my_priv_bytes: bytes, peer_pub_bytes: bytes) -> tuple:
     """
     Perform X25519 DH and derive a Fernet key from the shared secret.
 
-    The shared secret is hashed with SHA-256 and base64url-encoded to produce
-    a valid Fernet key.  Both sides must call this with each other's public key
-    to arrive at the same Fernet instance.
+    Returns (Fernet, raw_key_bytes: bytes).
+    The raw key bytes are returned separately so callers can use them for
+    sub-key derivation (e.g. derive_file_cipher_key) without accessing any
+    private attributes of the Fernet object.
+
+    Both sides must call this with each other's public key to arrive at
+    the same Fernet instance and raw key bytes.
     """
     priv = X25519PrivateKey.from_private_bytes(my_priv_bytes)
     peer_pub = X25519PublicKey.from_public_bytes(peer_pub_bytes)
     shared_secret = priv.exchange(peer_pub)
     # KDF: HKDF-SHA256 — consistent with the rest of the codebase.
-    # (Previously used raw sha256() which is not a proper KDF; patched.)
-    # Both sides must use the same info label to arrive at identical keys.
     key_material = HKDF(
         algorithm=hashes.SHA256(),
         length=32,
@@ -330,7 +394,7 @@ def dh_derive_shared_fernet(my_priv_bytes: bytes, peer_pub_bytes: bytes) -> Fern
         info=b"noeyes_pairwise_v1",
     ).derive(shared_secret)
     fernet_key = base64.urlsafe_b64encode(key_material)
-    return Fernet(fernet_key)
+    return Fernet(fernet_key), key_material
 
 
 # ---------------------------------------------------------------------------
