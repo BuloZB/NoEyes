@@ -212,11 +212,6 @@ class NoEyesClient:
         # the client's own _announce_pubkey) so without this guard the warning
         # fires twice for the same event.
         self._tofu_warned: set = set()
-        # When a TOFU mismatch fires we cache the peer's new (unverified) key here.
-        # /trust <peer> then promotes it into tofu_store immediately.
-        # Without this, /trust only deletes the old key; the new key is never stored
-        # and every future PM from that peer shows ? forever.
-        self._tofu_pending: dict[str, str] = {}
 
         # Buffer of incoming privmsg frames that arrived before pairwise key was ready
         self._privmsg_buffer: dict[str, list] = {}
@@ -361,8 +356,7 @@ class NoEyesClient:
             # Announce our Ed25519 pubkey
             self._announce_pubkey()
 
-            utils.play_startup_animation()
-            utils.switch_room_display(self.room)
+            utils.switch_room_display(self.room, show_banner=True)
             self._running = True
 
             self._recv_thread  = threading.Thread(target=self._recv_loop,  daemon=True)
@@ -485,8 +479,6 @@ class NoEyesClient:
         if is_new:
             utils.print_msg(utils.cok(f"[tofu] Trusted new key for {uname} (first contact)."))
         elif not trusted:
-            # Cache new key so /trust can promote it into tofu_store immediately.
-            self._tofu_pending[uname] = vk_hex
             self._tofu_mismatched.add(uname)
             if uname not in self._tofu_warned:
                 self._tofu_warned.add(uname)
@@ -1021,7 +1013,7 @@ class NoEyesClient:
             return
 
         if cmd == "/clear":
-            utils.switch_room_display(self.room)
+            utils.switch_room_display(self.room, show_banner=True)
             return
 
         if cmd == "/users":
@@ -1106,38 +1098,15 @@ class NoEyesClient:
                     f"[trust] No stored key for '{peer}' — nothing to update."
                 ))
                 return
-            # Remove the OLD key.
+            # Remove the stored key so the next pubkey_announce is trusted as fresh.
             del self.tofu_store[peer]
-
-            # If we already received the peer's new key via pubkey_announce this
-            # session, save it now so signature verification works immediately.
-            # Without this, /trust leaves tofu_store empty; carol never re-announces
-            # and every future PM shows ? forever.
-            if peer in self._tofu_pending:
-                new_key = self._tofu_pending.pop(peer)
-                self.tofu_store[peer] = new_key
-                id_mod.save_tofu(self.tofu_store, self.tofu_path)
-                utils.print_msg(utils.cok(
-                    f"[trust] Trusted new key for '{peer}': {new_key[:24]}...\n"
-                    "  Signature verification is now active for their messages."
-                ))
-            else:
-                id_mod.save_tofu(self.tofu_store, self.tofu_path)
-                utils.print_msg(utils.cok(
-                    f"[trust] Cleared stored key for '{peer}'.\n"
-                    "  Their next key announcement will be trusted automatically."
-                ))
-
-            # Clear any stale pairwise key — the peer has a new identity keypair.
-            # If the old pairwise survived (disconnect event missed or race),
-            # alice would encrypt with K_old but carol_id2 never had that key.
-            # Clearing forces a fresh DH handshake on the next /msg.
-            self._pairwise.pop(peer, None)
-            self._dh_pending.pop(peer, None)
-            self._privmsg_buffer.pop(peer, None)  # drop msgs buffered with old key
-
+            id_mod.save_tofu(self.tofu_store, self.tofu_path)
             self._tofu_mismatched.discard(peer)
             self._tofu_warned.discard(peer)
+            utils.print_msg(utils.cok(
+                f"[trust] Cleared stored key for '{peer}'.\n"
+                "  Their next key announcement will be trusted automatically."
+            ))
             return
 
         utils.print_msg(utils.cwarn(f"[warn] Unknown command: {cmd}. Type /help for help."))

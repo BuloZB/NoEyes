@@ -40,34 +40,20 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
 # Shared-passphrase Fernet (group chat, backward-compatible)
 # ---------------------------------------------------------------------------
 
-_PBKDF2_SALT_LEGACY = b"noeyes_static_salt_v1"  # kept for backward-compat only
-_PBKDF2_ITERATIONS   = 390_000
+_PBKDF2_SALT = b"noeyes_static_salt_v1"  # fixed academic salt (as before)
+_PBKDF2_ITERATIONS = 390_000
 
 
-def derive_fernet_key(passphrase: str, salt: bytes | None = None) -> tuple:
-    """
-    Derive a Fernet instance from a shared passphrase using PBKDF2-HMAC-SHA256.
-
-    Args:
-        passphrase: the shared passphrase string
-        salt:       32 random bytes.  Pass None only for legacy backward-compat
-                    (uses the old static salt so existing deployments still work).
-                    For new deployments always pass os.urandom(32).
-
-    Returns:
-        (Fernet, salt_bytes) — the derived Fernet key and the salt that was used.
-        Callers must persist the salt alongside the key so the same key can be
-        re-derived on the next run.
-    """
-    used_salt = salt if salt is not None else _PBKDF2_SALT_LEGACY
+def derive_fernet_key(passphrase: str) -> Fernet:
+    """Derive a Fernet instance from a shared passphrase using PBKDF2-HMAC-SHA256."""
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
         length=32,
-        salt=used_salt,
+        salt=_PBKDF2_SALT,
         iterations=_PBKDF2_ITERATIONS,
     )
     key = base64.urlsafe_b64encode(kdf.derive(passphrase.encode("utf-8")))
-    return Fernet(key), used_salt
+    return Fernet(key)
 
 
 def derive_room_fernet(master_fernet_key: bytes, room: str) -> Fernet:
@@ -90,60 +76,19 @@ def derive_room_fernet(master_fernet_key: bytes, room: str) -> Fernet:
 
 
 def load_key_file(path: str) -> Fernet:
-    """
-    Load a Fernet key from a key file.
-
-    Supports two formats:
-      v1 (legacy): a single URL-safe base64 line — the raw Fernet key.
-      v2 (new):    JSON {"v":2,"key":"<base64>","salt":"<hex>"} — the pre-derived
-                   Fernet key is stored directly so no PBKDF2 re-derivation is
-                   needed at load time.  The salt field is stored for auditing.
-    """
+    """Load a Fernet key from a key file (one URL-safe base64 line)."""
     p = Path(path).expanduser()
-    raw = p.read_text().strip()
-    if raw.startswith("{"):
-        data = json.loads(raw)
-        return Fernet(data["key"].encode())
-    # Legacy: plain base64 key
-    return Fernet(raw.encode())
+    key = p.read_text().strip().encode()
+    return Fernet(key)
 
 
 def generate_key_file(path: str) -> None:
-    """Generate a new random Fernet key and write it to *path* (v1 format)."""
+    """Generate a new Fernet key and write it to *path*."""
     p = Path(path).expanduser()
     p.parent.mkdir(parents=True, exist_ok=True)
     key = Fernet.generate_key()
     p.write_bytes(key)
-    p.chmod(0o600)
     print(f"[keygen] New Fernet key written to {p}")
-
-
-def derive_and_save_key_file(path: str, passphrase: str) -> Fernet:
-    """
-    Derive a Fernet key from *passphrase* with a fresh random salt, then save
-    it to *path* in v2 JSON format.
-
-    The derived key (not the passphrase) is stored — after this call the
-    passphrase is no longer needed.  Share the key FILE with other users, not
-    the passphrase.  Each call generates a different salt → different key, so
-    call this once per deployment then distribute the resulting file.
-
-    Returns the Fernet instance ready for use.
-    """
-    salt    = os.urandom(32)
-    raw_key = base64.urlsafe_b64encode(
-        PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=salt,
-            iterations=_PBKDF2_ITERATIONS,
-        ).derive(passphrase.encode("utf-8"))
-    ).decode()
-    p = Path(path).expanduser()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps({"v": 2, "key": raw_key, "salt": salt.hex()}))
-    p.chmod(0o600)
-    return Fernet(raw_key.encode())
 
 
 # ---------------------------------------------------------------------------

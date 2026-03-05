@@ -56,37 +56,7 @@ def _resolve_fernet(cfg: dict):
             "             python noeyes.py --connect HOST --key-file ./chat.key"
         ))
 
-    # ── Secure key derivation ──────────────────────────────────────────────────
-    # Instead of re-deriving from the passphrase on every run (which would
-    # reuse the same static salt each time), we derive ONCE with a fresh random
-    # salt, save the result to a key file, and use the key file from then on.
-    #
-    # This means:
-    #   - Each deployment gets a unique random salt → rainbow tables are useless.
-    #   - After the first run the passphrase is no longer needed.
-    #   - Other users should receive the generated key FILE, not the passphrase.
-    #
-    # Key file is saved to --key-file path if provided, otherwise to the
-    # default location ~/.noeyes/derived.key.
-    import os as _os
-    from pathlib import Path as _Path
-
-    save_path = cfg.get("key_file") or "~/.noeyes/derived.key"
-    save_p    = _Path(save_path).expanduser()
-
-    if save_p.exists():
-        # Key file already exists from a previous run — load it directly.
-        # No PBKDF2 re-derivation, no static salt.
-        return enc.load_key_file(save_path)
-
-    # First run with this passphrase: derive key with fresh random salt and save.
-    fernet = enc.derive_and_save_key_file(save_path, passphrase)
-    print(utils.cok(
-        f"[keygen] Passphrase derived and saved to {save_p}\n"
-        f"         Share this file (not the passphrase) with other users:\n"
-        f"           python noeyes.py --connect HOST --key-file {save_p}"
-    ))
-    return fernet
+    return enc.derive_fernet_key(passphrase)
 
 
 def _get_username(cfg: dict) -> str:
