@@ -414,4 +414,4 @@ cat ~/.noeyes/tofu_pubkeys.json
 
 ---
 
-Research & Educational Use Only — experimental project.
+⚠️Research & Educational Use Only — experimental project.
