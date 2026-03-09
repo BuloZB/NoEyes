@@ -161,7 +161,6 @@ termux-setup-storage
 | `\u2191` / `\u2193` | Scroll chat up / down |
 | `PgUp` / `PgDn` | Scroll chat one page |
 | `^P` (Ctrl+P) | Show / hide the sidebar panel |
-| `Esc` | Skip the current decrypt animation |
 | `^C` | Quit |
 
 ### Sidebar panel
