@@ -39,6 +39,9 @@ import argparse, hashlib, json, os, shutil, sys, tempfile, urllib.request
 # To rotate the key: update this constant and re-sign all manifests with the
 # new private key using gen_manifest.py.
 RELEASE_PUBKEY_HEX = "4773915d6e71a3509659cbc579ddb606a72a20e5ade65bac16f459e7c7c083d3"
+# Legacy key used in releases before v0.4.1 — kept so users on those versions
+# can still update. Will be removed in a future release.
+LEGACY_PUBKEY_HEX  = "22942493dda8680355434ad623b707db2fd40a4656d40b1d13288bef433f8654"
 
 from pathlib import Path
 
@@ -184,7 +187,6 @@ def cmd_update(force=False):
             from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
             from cryptography.exceptions import InvalidSignature
 
-            vk = Ed25519PublicKey.from_public_bytes(bytes.fromhex(RELEASE_PUBKEY_HEX))
             files_dict = manifest_obj.get("files", {})
             canonical  = json.dumps(files_dict, sort_keys=True, separators=(",", ":")).encode()
             sig_hex    = manifest_obj.get("sig", "")
@@ -192,15 +194,28 @@ def cmd_update(force=False):
                 err("manifest.json has no signature field.")
                 err("Aborting — your installation is unchanged.")
                 sys.exit(1)
-            vk.verify(bytes.fromhex(sig_hex), canonical)
+
+            # Try current key first, then legacy key (for users updating from
+            # an older release that was signed with the previous key).
+            verified = False
+            for pub_hex in (RELEASE_PUBKEY_HEX, LEGACY_PUBKEY_HEX):
+                try:
+                    vk = Ed25519PublicKey.from_public_bytes(bytes.fromhex(pub_hex))
+                    vk.verify(bytes.fromhex(sig_hex), canonical)
+                    verified = True
+                    break
+                except InvalidSignature:
+                    continue
+
+            if not verified:
+                err("MANIFEST SIGNATURE INVALID!")
+                err("The manifest may have been tampered with.")
+                err("Do NOT update until you can verify the repo is clean.")
+                err("Aborting — your installation is unchanged.")
+                sys.exit(1)
+
             ok("Manifest signature verified.")
             manifest = files_dict
-        except InvalidSignature:
-            err("MANIFEST SIGNATURE INVALID!")
-            err("The manifest may have been tampered with.")
-            err("Do NOT update until you can verify the repo is clean.")
-            err("Aborting — your installation is unchanged.")
-            sys.exit(1)
         except Exception as e:
             err(f"Signature verification failed: {e}")
             err("Aborting — your installation is unchanged.")
