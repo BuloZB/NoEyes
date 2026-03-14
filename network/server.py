@@ -1,43 +1,44 @@
 # FILE: server.py
 """
-server.py — NoEyes chat server (asyncio rewrite).
+server.py — NoEyes chat server (zero-metadata routing).
 
-The server is a BLIND FORWARDER.  It reads only the plaintext header JSON
-(routing metadata) and forwards the encrypted payload bytes verbatim.
-It has no keys, calls no decryption function, and cannot read any message.
+ZERO-METADATA ROUTING MODEL
+============================
+The server routes by opaque tokens only — it never sees display names,
+room names, or who is messaging whom.
 
-Why asyncio instead of threads:
-  - One OS thread handles all clients via an event loop.
-  - When a client is idle the coroutine is suspended with zero CPU cost.
-  - No GIL thrashing between idle threads → CPU drops to true idle → no heat.
-  - Memory per client: ~50 KB instead of ~8 MB (no per-client thread stack).
+  inbox_token = blake2s(vk_bytes, digest_size=16)   — client-computed
+  room_token  = blake2s((room + group_key_hex).encode(), digest_size=16) — client-computed
 
-Wire protocol (identical to v1 — clients unchanged):
-    [4 bytes: header_len BE uint32]
-    [4 bytes: payload_len BE uint32]
-    [header_len bytes: UTF-8 JSON — plaintext routing metadata]
-    [payload_len bytes: opaque encrypted bytes — never touched]
+What the server stores in RAM:
+  _clients          inbox_token → ClientConn  (socket handle only)
+  _history          room_token  → deque of encrypted payloads (no `from` field)
+  _privmsg_pairs    blake2s(token_a:token_b, session_salt) → rate-limit bucket
 
-Header fields the server inspects:
-    type       "chat"|"system"|"privmsg"|"dh_init"|"dh_resp"
-               |"pubkey_announce"|"command"|"heartbeat"
-    room       room name for broadcast routing
-    to         target username for point-to-point delivery
-    from       sender username
-    event      "join"|"leave"|"nick"|"users_req"|"join_room"
-    username   used by join/nick events
-    nick       new nickname (nick event)
-    vk_hex     Ed25519 verify key hex (pubkey_announce only)
+What the server NEVER stores:
+  - Display names / usernames
+  - Ed25519 public keys (vk_hex used only for auth challenge, then discarded)
+  - Room names (only hashed tokens)
+  - Sender identity on any forwarded frame (`from` stripped before routing)
 
-SECURITY INVARIANTS (unchanged from threaded version):
+Sender authentication uses SEALED SENDER:
+  - Chat:    display name + Ed25519 sig inside group-Fernet encrypted payload
+  - Privmsg: from_token + sig inside pairwise-Fernet encrypted payload
+  - DH:      from_token + sig inside group-Fernet encrypted inner dict
+  Recipients authenticate from the decrypted payload, not the header.
+
+Security invariants:
   - Zero calls to Fernet / .decrypt() / any private-key primitive.
-  - pubkey store holds ONLY verify-key hex strings, never signing keys.
-  - Server never derives DH keys; dh_init/dh_resp forwarded opaque.
+  - vk_hex used only for auth-challenge, never persisted.
+  - Server never derives DH keys; all payloads forwarded opaque.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
+import os
+import sys
 import struct
 import time
 from collections import defaultdict, deque
@@ -45,136 +46,54 @@ from typing import Optional
 
 logger = logging.getLogger("noeyes.server")
 
-# ---------------------------------------------------------------------------
-# Protocol constants
-# ---------------------------------------------------------------------------
-
-# Hard cap on the encrypted payload size per frame.
-#
-# WHY THIS MATTERS (vuln patched):
-#   payload_len is a uint32 — an attacker could send payload_len = 4 294 967 295
-#   (4 GB).  Without this guard the server would call asyncio.readexactly(4 GB),
-#   allocating 4 GB of RAM and blocking the entire event loop for every other
-#   client.  One TCP connection = full denial-of-service.
-#
-#   16 MB covers the largest legitimate frame (a 32 MB file chunk is split by
-#   the AES-GCM overhead; Fernet chat messages are always <1 KB).  Frames
-#   larger than this are either malformed or malicious.
-MAX_PAYLOAD = 16 * 1024 * 1024   # 16 MB
-
-# Separate cap for room history entries.  Keeps the 50-entry deque from storing
-# oversized blobs (50 × 16 MB = 800 MB max vs 50 × 4 GB = 200 GB without cap).
+MAX_PAYLOAD         = 16 * 1024 * 1024
 MAX_HISTORY_PAYLOAD = MAX_PAYLOAD
-
-# Replay-protection window.
-#
-# WHY (vuln patched):
-#   Without message IDs, a network attacker can capture an encrypted chat
-#   frame and re-inject it; the server forwards it and clients decrypt it
-#   again.  Fernet does not detect replays — only tampering.
-#
-#   Each chat/privmsg frame now carries a random `mid` (16 hex chars) in the
-#   plaintext header.  The server keeps the last REPLAY_WINDOW_SIZE IDs seen
-#   per room (plus a global set for privmsgs).  Frames whose `mid` is already
-#   in the set are silently dropped.
-REPLAY_WINDOW_SIZE = 1000   # per room; ~100 KB memory at 100-char IDs
-
-# Per-pair privmsg rate limit (server-enforced, clients cannot bypass).
-#
-# Token-bucket model: we keep a deque of timestamps for each (from, to) pair.
-# Before forwarding a privmsg, we drain entries older than the window, then
-# check if the count is below the limit.  The allowance refills naturally as
-# time passes — no hard reset needed, no scheduled tasks, zero CPU when idle.
-#
-# 25 messages per 15 minutes per pair is generous for legitimate pre-DH
-# buffering (DH completes in < 1 second in practice) while making a
-# flood attack 96× more expensive.
-PRIVMSG_PAIR_LIMIT  = 25     # max privmsgs from A to B in the window
-PRIVMSG_PAIR_WINDOW = 900    # seconds (15 minutes)
-
-# ---------------------------------------------------------------------------
-# Async framing helpers
-# ---------------------------------------------------------------------------
+REPLAY_WINDOW_SIZE  = 1000
+PRIVMSG_PAIR_LIMIT  = 25
+PRIVMSG_PAIR_WINDOW = 900
+MAX_CONNECTIONS     = 200
 
 
 async def _read_exact(reader: asyncio.StreamReader, n: int) -> Optional[bytes]:
-    """Read exactly *n* bytes; return None on EOF/error."""
     try:
-        data = await reader.readexactly(n)
-        return data
+        return await reader.readexactly(n)
     except (asyncio.IncompleteReadError, ConnectionResetError, OSError):
         return None
 
 
-async def recv_frame(
-    reader: asyncio.StreamReader,
-) -> Optional[tuple[dict, bytes]]:
-    """
-    Read one frame from *reader*.
-    Returns (header_dict, raw_payload_bytes) or None on disconnect.
-    Payload bytes are NEVER decrypted — returned raw.
-    """
+async def recv_frame(reader: asyncio.StreamReader) -> Optional[tuple[dict, bytes]]:
     size_buf = await _read_exact(reader, 8)
     if size_buf is None:
         return None
-
     header_len  = struct.unpack(">I", size_buf[:4])[0]
     payload_len = struct.unpack(">I", size_buf[4:8])[0]
-
-    # Guard against malformed/oversized headers
     if header_len > 65536:
-        logger.warning("Oversized header (%d bytes) — dropping connection", header_len)
+        logger.warning("Oversized header (%d bytes) — dropping", header_len)
         return None
-
-    # Guard against oversized payloads (CRITICAL vuln patched):
-    # Without this, a single frame with payload_len = 4 GB blocks the event
-    # loop and OOMs the server.  File chunk frames are at most ~16 MB after
-    # AES-GCM overhead; anything larger is malformed or a DoS attempt.
     if payload_len > MAX_PAYLOAD:
-        logger.warning(
-            "Oversized payload (%d bytes, max %d) — dropping connection",
-            payload_len, MAX_PAYLOAD,
-        )
+        logger.warning("Oversized payload (%d bytes) — dropping", payload_len)
         return None
-
     header_bytes = await _read_exact(reader, header_len)
     if header_bytes is None:
         return None
-
     payload_bytes = b""
     if payload_len:
         payload_bytes = await _read_exact(reader, payload_len)
         if payload_bytes is None:
             return None
-
     try:
-        header = json.loads(header_bytes.decode("utf-8"))
+        return json.loads(header_bytes.decode("utf-8")), payload_bytes
     except (json.JSONDecodeError, UnicodeDecodeError):
         logger.warning("Malformed header — dropping frame")
         return None
 
-    return header, payload_bytes
 
-
-async def send_frame(
-    writer: asyncio.StreamWriter,
-    header: dict,
-    payload: bytes = b"",
-) -> bool:
-    """
-    Write one frame to *writer*.
-    Returns False if the connection is already closing.
-    """
+async def send_frame(writer: asyncio.StreamWriter, header: dict, payload: bytes = b"") -> bool:
     if writer.is_closing():
         return False
     try:
-        hb = json.dumps(header, separators=(",", ":")).encode("utf-8")
-        frame = (
-            struct.pack(">I", len(hb)) +
-            struct.pack(">I", len(payload)) +
-            hb +
-            payload
-        )
+        hb    = json.dumps(header, separators=(",", ":")).encode("utf-8")
+        frame = struct.pack(">I", len(hb)) + struct.pack(">I", len(payload)) + hb + payload
         writer.write(frame)
         await writer.drain()
         return True
@@ -182,54 +101,25 @@ async def send_frame(
         return False
 
 
-# ---------------------------------------------------------------------------
-# Client state
-# ---------------------------------------------------------------------------
-
-
 class ClientConn:
-    """State for one connected client — no thread, no lock needed."""
-
-    def __init__(
-        self,
-        writer:   asyncio.StreamWriter,
-        addr:     tuple,
-    ):
-        self.writer   = writer
-        self.addr     = addr
-        self.username: str   = ""
-        self.room:     str   = "general"
-        self.vk_hex:   str   = ""
-        self.alive:    bool  = True
-        # Rate limiting: timestamps of recent messages (two separate buckets)
-        self._msg_times: deque = deque()   # chat / privmsg frames
-        self._ctrl_times: deque = deque()  # DH / join / nick / pubkey frames
-        self._ctrl_limit: int  = 0         # set by NoEyesServer after init
+    def __init__(self, writer: asyncio.StreamWriter, addr: tuple):
+        self.writer       = writer
+        self.addr         = addr
+        self.inbox_token: str  = ""
+        self.room:        str  = ""
+        self.alive:       bool = True
+        self._msg_times:  deque = deque()
+        self._ctrl_times: deque = deque()
+        self._ctrl_limit: int   = 0
 
     async def send(self, header: dict, payload: bytes = b"") -> bool:
-        """Send a frame to this client. Returns False on error."""
         ok = await send_frame(self.writer, header, payload)
         if not ok:
             self.alive = False
         return ok
 
     def check_rate_limit(self, limit_per_minute: int, *, control: bool = False) -> bool:
-        """
-        Sliding-window rate limiter with separate buckets for chat vs control.
-
-        WHY TWO BUCKETS (vuln patched):
-          Previously all frame types shared one 30/min counter.  An attacker
-          with chat.key could send 30 dh_init frames/minute to a victim; the
-          victim's client auto-responds with dh_resp, exhausting the victim's
-          entire quota so they cannot send chat messages.
-
-          Now:
-            control=False (chat/privmsg)  → main bucket, limit_per_minute
-            control=True  (DH, join, pubkey_announce, nick, users_req) →
-                           separate bucket capped at limit_per_minute // 3
-                           (10/min by default — plenty for legitimate use)
-        """
-        now = time.monotonic()
+        now    = time.monotonic()
         bucket = self._ctrl_times if control else self._msg_times
         limit  = max(1, self._ctrl_limit) if control else limit_per_minute
         while bucket and (now - bucket[0]) > 60:
@@ -240,29 +130,19 @@ class ClientConn:
         return True
 
 
-# ---------------------------------------------------------------------------
-# Server
-# ---------------------------------------------------------------------------
-
-
 class NoEyesServer:
-    """
-    Async TCP chat server — rooms, rate limiting, heartbeat, history.
-
-    BLIND FORWARDER: payload bytes forwarded verbatim, never decrypted.
-    Single-threaded asyncio — zero CPU when idle, low heat, low battery.
-    """
+    """Zero-metadata async TCP chat server."""
 
     def __init__(
         self,
-        host:                 str = "0.0.0.0",
-        port:                 int = 5000,
-        history_size:         int = 50,
-        rate_limit_per_minute: int = 30,
-        heartbeat_interval:   int = 20,
-        ssl_cert:             str = "",
-        ssl_key:              str = "",
-        no_tls:               bool = False,
+        host:                  str  = "0.0.0.0",
+        port:                  int  = 5000,
+        history_size:          int  = 50,
+        rate_limit_per_minute: int  = 30,
+        heartbeat_interval:    int  = 20,
+        ssl_cert:              str  = "",
+        ssl_key:               str  = "",
+        no_tls:                bool = False,
     ):
         self.host               = host
         self.port               = port
@@ -273,282 +153,200 @@ class NoEyesServer:
         self.ssl_key            = ssl_key
         self.no_tls             = no_tls
 
-        # username → ClientConn
+        # inbox_token → ClientConn  (no display names stored)
         self._clients: dict[str, ClientConn] = {}
-        # room → deque[(header, payload)]
-        self._history: dict[str, deque] = defaultdict(
-            lambda: deque(maxlen=history_size)
-        )
-        # username → vk_hex (Ed25519 verify key, plaintext header value)
-        self._pubkeys: dict[str, str] = {}
 
-        # Replay protection: room → deque of seen `mid` values (capped at REPLAY_WINDOW_SIZE).
-        # A separate global set handles privmsg MIDs (not room-scoped).
-        self._room_mids:  dict[str, deque] = defaultdict(
-            lambda: deque(maxlen=REPLAY_WINDOW_SIZE)
-        )
+        # room_token → deque[(header_no_from, payload)]
+        self._history: dict[str, deque] = defaultdict(lambda: deque(maxlen=history_size))
+
+        # Replay protection
+        self._room_mids: dict[str, deque] = defaultdict(lambda: deque(maxlen=REPLAY_WINDOW_SIZE))
         self._priv_mids: deque = deque(maxlen=REPLAY_WINDOW_SIZE)
 
-        # Per-pair privmsg token bucket: (from, to) → deque of send timestamps.
-        # Enforces PRIVMSG_PAIR_LIMIT frames per PRIVMSG_PAIR_WINDOW seconds
-        # per sender→recipient pair.  Clients cannot bypass this — it lives on
-        # the server and the server is the blind forwarder everyone connects to.
-        # Token-bucket model: old timestamps outside the window are drained first,
-        # so the allowance refills naturally as time passes — no hard resets.
-        self._privmsg_pairs: dict[tuple, deque] = defaultdict(deque)
+        # Per-pair rate limiting — keyed by BLAKE2s hash, never plaintext tokens
+        self._pair_salt: bytes = os.urandom(32)
+        self._privmsg_pairs: dict[str, deque] = defaultdict(deque)
+        self._token_pair_hashes: dict[str, set] = defaultdict(set)
 
-    # ------------------------------------------------------------------
-    # Entry point
-    # ------------------------------------------------------------------
+        self._current_bore_port: int = 0
+        self._conn_sem: Optional[asyncio.Semaphore] = None
 
     def run(self) -> None:
-        """Start the event loop. Blocks until Ctrl+C."""
         try:
             asyncio.run(self._main())
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, SystemExit):
+            pass
+        finally:
+            sys.stdout.write("\r\033[2K")
+            sys.stdout.flush()
             print("\n[server] Shutting down.")
 
+    def broadcast_migrate(self, new_port: int) -> None:
+        self._current_bore_port = new_port
+        loop = getattr(self, "_loop", None)
+        if loop and loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._do_broadcast_migrate(new_port), loop)
+
     async def _main(self) -> None:
+        self._loop    = asyncio.get_running_loop()
+        self._conn_sem = asyncio.Semaphore(MAX_CONNECTIONS)
+
         import ssl as _ssl
         from core import encryption as _enc
 
-        # ── Auto-TLS ──────────────────────────────────────────────────────────
-        # NoEyes always uses TLS to protect transport metadata (usernames, room
-        # names, timestamps, frame sizes).  A self-signed cert is auto-generated
-        # on first run and reused on every subsequent start.
-        #
-        # Clients verify the cert via TOFU on the SHA-256 fingerprint — same
-        # model as SSH.  First connection trusts the cert; any later change
-        # triggers a warning so MITM attacks are detected.
-        #
-        # Manual cert override: pass --cert and --tls-key to use your own cert
-        # (e.g. a Let's Encrypt cert for a production server with a domain).
-        # Pass --no-tls to disable TLS entirely (LAN-only, not recommended).
         ssl_ctx = None
         if not self.no_tls:
-            # Resolve cert/key paths — use override if supplied, else auto paths
             cert_path = self.ssl_cert or "~/.noeyes/server.crt"
             key_path  = self.ssl_key  or "~/.noeyes/server.key"
-            from pathlib import Path as _Path
-            if not _Path(cert_path).expanduser().exists():
+            from pathlib import Path as _P
+            if not _P(cert_path).expanduser().exists():
                 print("[server] Generating self-signed TLS certificate...")
                 _enc.generate_tls_cert(cert_path, key_path)
                 fp = _enc.get_tls_fingerprint(cert_path)
-                print(f"[server] Certificate generated.")
                 print(f"[server] Fingerprint: {fp[:16]}...{fp[-16:]}")
             ssl_ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
             try:
-                ssl_ctx.load_cert_chain(
-                    _Path(cert_path).expanduser(),
-                    _Path(key_path).expanduser(),
-                )
+                ssl_ctx.load_cert_chain(_P(cert_path).expanduser(), _P(key_path).expanduser())
             except Exception as e:
-                print(f"[server] TLS setup failed: {e} — falling back to no TLS.")
+                print(f"[server] TLS failed: {e}")
                 ssl_ctx = None
 
         server = await asyncio.start_server(
-            self._handle_client,
-            self.host,
-            self.port,
-            reuse_address=True,
-            ssl=ssl_ctx,
+            self._handle_client, self.host, self.port,
+            reuse_address=True, ssl=ssl_ctx,
         )
         async with server:
             addrs = ", ".join(str(s.getsockname()) for s in server.sockets)
             if ssl_ctx:
-                from core import encryption as _enc2
-                cert_path = self.ssl_cert or "~/.noeyes/server.crt"
-                fp = _enc2.get_tls_fingerprint(cert_path)
+                fp    = _enc.get_tls_fingerprint(self.ssl_cert or "~/.noeyes/server.crt")
                 proto = f"TLS — fingerprint: {fp[:16]}...{fp[-16:]}"
             else:
-                proto = "no TLS (--no-tls) — messages are E2E encrypted client-side"
+                proto = "no TLS (--no-tls)"
             print(f"[server] Listening on {addrs} ({proto})")
             logger.info("NoEyes server listening on %s (%s)", addrs, proto)
             asyncio.create_task(self._heartbeat_loop())
             await server.serve_forever()
-
-    # ------------------------------------------------------------------
-    # Per-client coroutine  (replaces the per-client thread)
-    # ------------------------------------------------------------------
 
     async def _handle_client(
         self,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
-        addr = writer.get_extra_info("peername")
-        conn = ClientConn(writer, addr)
-        # Log full IP only at DEBUG so it never appears in default INFO logs.
-        # At INFO we log only an anonymised prefix (first two octets / 64-bit
-        # IPv6 prefix) so operators get some geographic signal without storing
-        # the full address in log files that might be world-readable.
-        import hashlib as _hl
-        _ip = str(addr[0]) if addr else "?"
+        sem = self._conn_sem
+        if sem is not None and sem.locked():
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except OSError:
+                pass
+            return
+        async with (sem if sem is not None else _null_context()):
+            await self._handle_client_inner(reader, writer)
+
+    async def _handle_client_inner(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        addr     = writer.get_extra_info("peername")
+        conn     = ClientConn(writer, addr)
+        _ip      = str(addr[0]) if addr else "?"
         _ip_anon = ".".join(_ip.split(".")[:2]) + ".*.*" if "." in _ip \
-            else ":".join(_ip.split(":")[:4]) + ":…"
+                   else ":".join(_ip.split(":")[:4]) + ":…"
         logger.debug("New connection from %s", addr)
         logger.info("New connection from %s", _ip_anon)
         print(f"  [server] Incoming connection from {_ip_anon}", flush=True)
 
         try:
-            # First frame must be a join event
-            result = await recv_frame(reader)
+            # CVE-NE-003: timeout on join frame
+            try:
+                result = await asyncio.wait_for(recv_frame(reader), timeout=10.0)
+            except asyncio.TimeoutError:
+                return
             if result is None:
                 return
-            header, payload = result
+            header, _ = result
 
             if header.get("type") != "system" or header.get("event") != "join":
-                logger.warning("First frame was not join from %s", addr)
                 return
 
-            # Normalise to lowercase to prevent case-variant impersonation:
-            # without this, 'alice' and 'Alice' are treated as different users
-            # and get separate TOFU entries, letting an attacker register 'Alice'
-            # with their own key while the real 'alice' already exists.
-            username = str(header.get("username", "")).strip().lower()[:32]
-            room     = str(header.get("room", "general")).strip().lower()[:64]
-            vk_hex   = str(header.get("vk_hex", "")).strip()
+            # Zero-metadata join — server sees only opaque tokens.
+            inbox_token = str(header.get("inbox_token", "")).strip()[:64]
+            room_token  = str(header.get("room", "")).strip()[:64]
+            vk_hex      = str(header.get("vk_hex", "")).strip()   # auth only, discarded after
 
-            if not username:
+            if not inbox_token or not room_token:
                 return
 
-            # Handle duplicate username:
-            # Branch 1 — dead session: require pubkey match if we have a stored key,
-            #   so a crashed user's slot cannot be sniped by anyone who notices the
-            #   gap before the server cleans up.
-            # Branch 2 — live session, same pubkey claimed: issue a challenge nonce
-            #   and require the client to sign it with their Ed25519 private key.
-            #   This proves ownership of the key and prevents an attacker who merely
-            #   observed the public key from impersonating the user.
-            # Branch 3 — everything else: reject.
-            if username in self._clients:
-                old_conn = self._clients[username]
+            # Duplicate token handling (same identity reconnecting)
+            if inbox_token in self._clients:
+                old_conn = self._clients[inbox_token]
                 if not old_conn.alive:
-                    # Dead session — evict only if pubkey matches (or no key stored yet)
-                    stored_key = self._pubkeys.get(username)
-                    if stored_key and vk_hex != stored_key:
-                        await send_frame(writer, {
-                            "type":    "system",
-                            "event":   "nick_error",
-                            "message": f"Username '{username}' is already taken.",
-                            "ts":      _now_ts(),
-                        })
-                        return
-                    self._clients.pop(username, None)
-                    try:
-                        old_conn.writer.close()
-                    except Exception:
-                        pass
-                elif vk_hex and self._pubkeys.get(username) == vk_hex:
-                    # Same pubkey claimed — challenge before allowing takeover.
-                    import os as _os
-                    nonce = _os.urandom(32).hex()
-                    await send_frame(writer, {
-                        "type":  "system",
-                        "event": "auth_challenge",
-                        "nonce": nonce,
-                        "ts":    _now_ts(),
-                    })
+                    self._clients.pop(inbox_token, None)
+                    try: old_conn.writer.close()
+                    except Exception: pass
+                elif vk_hex:
+                    nonce = os.urandom(32).hex()
+                    await send_frame(writer, {"type": "system", "event": "auth_challenge",
+                                              "nonce": nonce, "ts": _now_ts()})
                     try:
                         resp = await asyncio.wait_for(recv_frame(reader), timeout=10.0)
                     except asyncio.TimeoutError:
                         return
-                    if resp is None:
+                    if resp is None or resp[0].get("event") != "auth_response":
                         return
-                    resp_header, _ = resp
-                    if resp_header.get("type") != "system" or \
-                            resp_header.get("event") != "auth_response":
-                        return
-                    sig_hex = str(resp_header.get("sig", "")).strip()
+                    sig_hex = str(resp[0].get("sig", "")).strip()
                     try:
                         from core import encryption as _enc
-                        _verified = _enc.verify_signature(
-                            bytes.fromhex(vk_hex),
-                            nonce.encode(),
-                            bytes.fromhex(sig_hex),
+                        _ok = _enc.verify_signature(
+                            bytes.fromhex(vk_hex), nonce.encode(), bytes.fromhex(sig_hex)
                         )
                     except Exception:
-                        _verified = False
-                    if not _verified:
-                        await send_frame(writer, {
-                            "type":    "system",
-                            "event":   "nick_error",
-                            "message": "Authentication failed — could not verify identity key.",
-                            "ts":      _now_ts(),
-                        })
+                        _ok = False
+                    if not _ok:
+                        await send_frame(writer, {"type": "system", "event": "auth_failed",
+                                                  "message": "Authentication failed.", "ts": _now_ts()})
                         return
-                    # Verified — kick stale session and let new one take over
                     old_conn.alive = False
-                    self._clients.pop(username, None)
-                    try:
-                        old_conn.writer.close()
-                    except Exception:
-                        pass
+                    self._clients.pop(inbox_token, None)
+                    try: old_conn.writer.close()
+                    except Exception: pass
                 else:
-                    await send_frame(writer, {
-                        "type":    "system",
-                        "event":   "nick_error",
-                        "message": f"Username '{username}' is already taken.",
-                        "ts":      _now_ts(),
-                    })
+                    await send_frame(writer, {"type": "system", "event": "auth_failed",
+                                              "message": "Token in use.", "ts": _now_ts()})
                     return
+            # vk_hex NOT stored — discarded after auth challenge above.
 
-            conn.username = username
-            conn.room     = room
-            conn.vk_hex   = vk_hex
-            # Control bucket limit: 2× the chat limit.
-            # WHY 2× and not equal:
-            #   The DoS fix only requires that control frames (dh_init, dh_resp…)
-            #   and chat frames draw from SEPARATE pools so an attacker's flood of
-            #   dh_init cannot exhaust a victim's chat quota.  The control bucket
-            #   does NOT need to be tighter than the chat bucket — reducing it would
-            #   throttle legitimate multi-peer DH sessions (e.g. joining a large group
-            #   and establishing keys with 20 people within one minute).
-            conn._ctrl_limit = max(1, self.rate_limit * 2)   # 60/min at default 30
-            self._clients[username] = conn
+            conn.inbox_token = inbox_token
+            conn.room        = room_token
+            conn._ctrl_limit = max(1, self.rate_limit * 2)
+            self._clients[inbox_token] = conn
 
-            if vk_hex:
-                self._pubkeys[username] = vk_hex
+            auth_ok: dict = {"type": "system", "event": "auth_ok", "ts": _now_ts()}
+            if self._current_bore_port:
+                auth_ok["bore_port"] = self._current_bore_port
+            await send_frame(writer, auth_ok)
 
-            # Acknowledge the join before replaying history.
-            # This gives the client a single deterministic signal that the
-            # handshake is complete and history frames are about to follow.
-            await send_frame(writer, {
-                "type":  "system",
-                "event": "auth_ok",
-                "ts":    _now_ts(),
-            })
-
-            # Replay history to the new joiner
-            history_snapshot = list(self._history[room])
-            for h, p in history_snapshot:
+            # History replay — headers have `from` stripped at store time
+            for h, p in list(self._history[room_token]):
                 await conn.send(h, p)
 
-            # Broadcast join event to room
-            join_header = {
-                "type":     "system",
-                "event":    "join",
-                "username": username,
-                "room":     room,
-                "ts":       _now_ts(),
-            }
-            await self._broadcast_room(room, join_header, b"", exclude=username)
+            # Broadcast join with opaque token only
+            await self._broadcast_room(room_token, {
+                "type": "system", "event": "join",
+                "inbox_token": inbox_token, "room": room_token, "ts": _now_ts(),
+            }, b"", exclude=inbox_token)
 
-            # Send known pubkeys of room members to new joiner
-            await self._send_known_pubkeys(conn, room)
+            logger.info("[%s…] joined [%s…]", inbox_token[:8], room_token[:8])
 
-            logger.info("%s joined room '%s'", username, room)
-
-            # Main receive loop — suspends cheaply between frames
             while conn.alive:
                 result = await recv_frame(reader)
                 if result is None:
                     break
-                h, p = result
-                await self._dispatch(conn, h, p)
+                await self._dispatch(conn, result[0], result[1])
 
         except Exception as exc:
-            logger.exception("Unhandled error for %s: %s", addr, exc)
+            logger.exception("Unhandled error for %s: %s", _ip_anon, exc)
         finally:
             await self._disconnect(conn)
             try:
@@ -557,315 +355,192 @@ class NoEyesServer:
             except OSError:
                 pass
 
-    # ------------------------------------------------------------------
-    # Frame dispatcher
-    # ------------------------------------------------------------------
-
-    async def _dispatch(
-        self,
-        conn:    ClientConn,
-        header:  dict,
-        payload: bytes,
-    ) -> None:
+    async def _dispatch(self, conn: ClientConn, header: dict, payload: bytes) -> None:
         msg_type = header.get("type", "")
 
-        # Rate limiting — skip for heartbeats (they're dropped anyway).
-        # Control frames (DH, pubkey, nick, join) use a separate smaller bucket
-        # so a flood of dh_init from an attacker cannot exhaust a victim's chat quota.
-        if msg_type != "heartbeat":
-            is_control = msg_type in (
-                "dh_init", "dh_resp", "pubkey_announce", "command",
-            )
-            if not conn.check_rate_limit(self.rate_limit, control=is_control):
-                await conn.send({
-                    "type":  "system",
-                    "event": "rate_limit",
-                    "ts":    _now_ts(),
-                })
+        is_file_chunk = (msg_type == "privmsg" and header.get("subtype") == "file_chunk_bin")
+        if msg_type != "heartbeat" and not is_file_chunk:
+            is_ctrl = msg_type in ("dh_init", "dh_resp", "pubkey_announce", "command")
+            if not conn.check_rate_limit(self.rate_limit, control=is_ctrl):
+                await conn.send({"type": "system", "event": "rate_limit", "ts": _now_ts()})
                 return
 
-        # Heartbeat from client — it's an ACK, just drop it silently.
-        # Do NOT echo back or we create an infinite ping-pong loop.
         if msg_type == "heartbeat":
             return
 
-        # Pubkey announcement — store and rebroadcast to room
+        # pubkey_announce: forward verbatim — server NEVER stores pubkeys.
+        # Clients maintain their own TOFU stores; server is a pure relay here.
         if msg_type == "pubkey_announce":
-            vk_hex = str(header.get("vk_hex", "")).strip()
-            if vk_hex:
-                self._pubkeys[conn.username] = vk_hex
-                conn.vk_hex = vk_hex
-                announce = {
-                    "type":     "pubkey_announce",
-                    "username": conn.username,
-                    "vk_hex":   vk_hex,
-                    "room":     conn.room,
-                    "ts":       _now_ts(),
-                }
-                await self._broadcast_room(
-                    conn.room, announce, b"", exclude=conn.username, record=False
-                )
+            fwd = {k: v for k, v in header.items() if k != "from"}
+            fwd["ts"] = _now_ts()
+            await self._broadcast_room(conn.room, fwd, payload,
+                                       exclude=conn.inbox_token, record=False)
             return
 
-        # DH handshake — route point-to-point, payload forwarded blind
+        # DH handshake: route by inbox_token, `from` stripped (sealed sender)
         if msg_type in ("dh_init", "dh_resp"):
-            to_user       = header.get("to", "")
-            header["from"] = conn.username
-            header["ts"]   = _now_ts()
-            await self._send_to_user(to_user, header, payload)
+            to_token = header.get("to", "")
+            fwd = {"type": msg_type, "to": to_token, "ts": _now_ts()}
+            # from_token must be forwarded so recipient can identify sender
+            # (server strips `from` username but token routing needs this)
+            for k in ("mid", "subtype", "from_token"):
+                if k in header: fwd[k] = header[k]
+            await self._send_to_token(to_token, fwd, payload)
             return
 
-        # Commands
         if msg_type == "command":
-            event = header.get("event", "")
-            if event == "users_req":
+            ev = header.get("event", "")
+            if ev == "users_req":
                 await self._handle_users_req(conn)
-            elif event == "nick":
-                await self._handle_nick(conn, header)
-            elif event == "join_room":
+            elif ev == "nick":
+                await self._handle_nick_relay(conn, header)
+            elif ev == "join_room":
                 await self._handle_join_room(conn, header)
             return
 
-        # Chat (broadcast) and privmsg (point-to-point) — payload never decrypted
-        if msg_type in ("chat", "privmsg"):
-            header["from"] = conn.username
-            header["ts"]   = _now_ts()
-
-            # Replay protection: reject frames whose mid was already seen.
-            mid = str(header.get("mid", ""))
+        # Room chat: NO `from` stamp — sender name lives inside encrypted payload.
+        if msg_type == "chat":
+            room = conn.room
+            mid  = str(header.get("mid", ""))
             if mid:
-                if msg_type == "privmsg":
-                    if mid in self._priv_mids:
-                        logger.debug("Replay rejected: privmsg mid=%s", mid)
-                        return
-                    self._priv_mids.append(mid)
-                else:
-                    room_mids = self._room_mids[conn.room]
-                    if mid in room_mids:
-                        logger.debug("Replay rejected: chat mid=%s room=%s", mid, conn.room)
-                        return
-                    room_mids.append(mid)
-
-            if msg_type == "privmsg":
-                to_user = header.get("to", "")
-                # Binary file chunks are exempt from the text rate limiter —
-                # they are already authenticated per-chunk with AES-256-GCM
-                # and a large file would be silently dropped mid-transfer otherwise.
-                is_file_chunk = header.get("subtype") == "file_chunk_bin"
-                if not is_file_chunk:
-                    # Server-side per-pair token bucket — clients cannot bypass this.
-                    pair   = (conn.username, to_user)
-                    bucket = self._privmsg_pairs[pair]
-                    now_ts = time.monotonic()
-                    while bucket and (now_ts - bucket[0]) > PRIVMSG_PAIR_WINDOW:
-                        bucket.popleft()
-                    if len(bucket) >= PRIVMSG_PAIR_LIMIT:
-                        logger.debug(
-                            "privmsg rate limit: %s → %s (%d/%d in %ds)",
-                            conn.username, to_user,
-                            len(bucket), PRIVMSG_PAIR_LIMIT, PRIVMSG_PAIR_WINDOW,
-                        )
-                        await conn.send({
-                            "type":    "system",
-                            "event":   "rate_limit",
-                            "message": f"Sending too fast to {to_user} — slow down.",
-                            "ts":      _now_ts(),
-                        })
-                        return
-                    bucket.append(now_ts)
-                await self._send_to_user(to_user, header, payload)
-            else:
-                room = header.get("room", conn.room)
-                if room != conn.room:
-                    room = conn.room   # cannot broadcast to other rooms
-                await self._broadcast_room(room, header, payload, record=True, exclude=conn.username)
+                rm = self._room_mids[room]
+                if mid in rm: return
+                rm.append(mid)
+            fwd = {"type": "chat", "room": room, "ts": _now_ts()}
+            if mid: fwd["mid"] = mid
+            await self._broadcast_room(room, fwd, payload, record=True, exclude=conn.inbox_token)
             return
 
-        # Client-initiated leave
+        # Privmsg: route by inbox_token, `from` stripped (sealed sender)
+        if msg_type == "privmsg":
+            to_token = header.get("to", "")
+            mid      = str(header.get("mid", ""))
+            if mid:
+                if mid in self._priv_mids: return
+                self._priv_mids.append(mid)
+
+            if not is_file_chunk:
+                pair_hash = hashlib.blake2s(
+                    f"{conn.inbox_token}:{to_token}".encode(),
+                    key=self._pair_salt[:32], digest_size=8,
+                ).hexdigest()
+                self._token_pair_hashes[conn.inbox_token].add(pair_hash)
+                self._token_pair_hashes[to_token].add(pair_hash)
+                bucket = self._privmsg_pairs[pair_hash]
+                now_ts = time.monotonic()
+                while bucket and (now_ts - bucket[0]) > PRIVMSG_PAIR_WINDOW:
+                    bucket.popleft()
+                if len(bucket) >= PRIVMSG_PAIR_LIMIT:
+                    await conn.send({"type": "system", "event": "rate_limit",
+                                     "message": "Sending too fast.", "ts": _now_ts()})
+                    return
+                bucket.append(now_ts)
+
+            fwd = {"type": "privmsg", "to": to_token, "ts": _now_ts()}
+            for k in ("mid", "subtype", "from_token"):
+                if k in header: fwd[k] = header[k]
+            await self._send_to_token(to_token, fwd, payload)
+            return
+
         if msg_type == "system" and header.get("event") == "leave":
             conn.alive = False
             return
 
-        logger.debug("Unknown frame type '%s' from %s", msg_type, conn.username)
-
-    # ------------------------------------------------------------------
-    # Routing helpers — NO decryption, payload forwarded opaque
-    # ------------------------------------------------------------------
+        logger.debug("Unknown frame type '%s'", msg_type)
 
     async def _broadcast_room(
-        self,
-        room:    str,
-        header:  dict,
-        payload: bytes,
-        *,
-        exclude: Optional[str] = None,
-        record:  bool = False,
+        self, room: str, header: dict, payload: bytes,
+        *, exclude: Optional[str] = None, record: bool = False,
     ) -> None:
-        """Send a frame to every client in *room*, optionally skipping one."""
-        targets = [
-            c for u, c in self._clients.items()
-            if c.room == room and u != exclude
-        ]
+        targets = [c for t, c in self._clients.items() if c.room == room and t != exclude]
         if record:
-            self._history[room].append((header, payload))
-        for client in targets:
-            await client.send(header, payload)
+            stored = {k: v for k, v in header.items() if k != "from"}
+            self._history[room].append((stored, payload))
+        for c in targets:
+            await c.send(header, payload)
 
-    async def _send_to_user(
-        self,
-        username: str,
-        header:   dict,
-        payload:  bytes,
-    ) -> bool:
-        """Send a frame to a single user. Returns False if not found."""
-        conn = self._clients.get(username)
+    async def _send_to_token(self, token: str, header: dict, payload: bytes) -> bool:
+        conn = self._clients.get(token)
         if conn is None:
             return False
         return await conn.send(header, payload)
 
-    async def _send_known_pubkeys(
-        self,
-        new_conn: ClientConn,
-        room:     str,
-    ) -> None:
-        """Send all known room-member pubkeys to a newly joined client."""
-        for uname, c in self._clients.items():
-            if c.room == room and c.vk_hex and uname != new_conn.username:
-                await new_conn.send({
-                    "type":     "pubkey_announce",
-                    "username": uname,
-                    "vk_hex":   c.vk_hex,
-                    "room":     room,
-                    "ts":       _now_ts(),
-                }, b"")
-
-    # ------------------------------------------------------------------
-    # Command handlers
-    # ------------------------------------------------------------------
-
     async def _handle_users_req(self, conn: ClientConn) -> None:
-        users = [u for u, c in self._clients.items() if c.room == conn.room]
-        await conn.send({
-            "type":  "command",
-            "event": "users_resp",
-            "users": users,
-            "room":  conn.room,
-            "ts":    _now_ts(),
-        })
+        """Return opaque inbox_tokens — clients resolve to names via their TOFU store."""
+        tokens = [t for t, c in self._clients.items() if c.room == conn.room]
+        await conn.send({"type": "command", "event": "users_resp",
+                         "tokens": tokens, "room": conn.room, "ts": _now_ts()})
 
-    async def _handle_nick(self, conn: ClientConn, header: dict) -> None:
-        new_nick = str(header.get("nick", "")).strip().lower()[:32]
-        if not new_nick:
-            return
-        old_nick = conn.username
-
-        if new_nick in self._clients:
-            await conn.send({
-                "type":    "system",
-                "event":   "nick_error",
-                "message": f"Username '{new_nick}' is already taken.",
-                "ts":      _now_ts(),
-            })
-            return
-
-        del self._clients[old_nick]
-        conn.username = new_nick
-        self._clients[new_nick] = conn
-        if old_nick in self._pubkeys:
-            self._pubkeys[new_nick] = self._pubkeys.pop(old_nick)
-
-        # Broadcast nick change to ALL rooms, not just the current one.
-        # If we only broadcast to conn.room, clients in other rooms keep sending
-        # /msg to the old name, which the server can no longer route — silent drop.
-        nick_event = {
-            "type":     "system",
-            "event":    "nick",
-            "old_nick": old_nick,
-            "new_nick": new_nick,
-            "room":     conn.room,
-            "ts":       _now_ts(),
-        }
-        seen = set()
-        for uname, c in list(self._clients.items()):
-            if c.room not in seen and uname != new_nick:
-                seen.add(c.room)
-        for room in seen:
-            await self._broadcast_room(room, nick_event, b"", exclude=new_nick)
+    async def _handle_nick_relay(self, conn: ClientConn, header: dict) -> None:
+        """Nick is display-only — server just relays, holds no display names."""
+        await self._broadcast_room(conn.room, {
+            "type": "system", "event": "nick",
+            "old_nick":    header.get("old_nick", ""),
+            "new_nick":    header.get("nick", ""),
+            "inbox_token": conn.inbox_token,
+            "room":        conn.room,
+            "ts":          _now_ts(),
+        }, b"", exclude=conn.inbox_token)
 
     async def _handle_join_room(self, conn: ClientConn, header: dict) -> None:
-        new_room = str(header.get("room", "general")).strip().lower()[:64]
         old_room = conn.room
-
-        # Notify old room — reason:"room_change" so clients keep pairwise keys
+        new_room = str(header.get("room", "")).strip()[:64]
+        if not new_room:
+            return
         await self._broadcast_room(old_room, {
-            "type":     "system",
-            "event":    "leave",
-            "username": conn.username,
-            "room":     old_room,
-            "reason":   "room_change",
-            "ts":       _now_ts(),
-        }, b"", exclude=conn.username)
-
+            "type": "system", "event": "leave",
+            "inbox_token": conn.inbox_token, "room": old_room,
+            "reason": "room_change", "ts": _now_ts(),
+        }, b"", exclude=conn.inbox_token)
         conn.room = new_room
-
-        # Notify new room
         await self._broadcast_room(new_room, {
-            "type":     "system",
-            "event":    "join",
+            "type": "system", "event": "join",
+            "inbox_token": conn.inbox_token,
             "username": conn.username,
-            "room":     new_room,
-            "ts":       _now_ts(),
-        }, b"", exclude=conn.username)
-
-        # Replay history so client sees messages sent while they were away.
-        history = list(self._history[new_room])
-        for h, p in history:
+            "room": new_room, "ts": _now_ts(),
+        }, b"", exclude=conn.inbox_token)
+        for h, p in list(self._history[new_room]):
             await conn.send(h, p)
 
-    # ------------------------------------------------------------------
-    # Disconnect / cleanup
-    # ------------------------------------------------------------------
-
     async def _disconnect(self, conn: ClientConn) -> None:
-        if not conn.username:
+        if not conn.inbox_token:
             return
-        self._clients.pop(conn.username, None)
+        self._clients.pop(conn.inbox_token, None)
         conn.alive = False
-        logger.info("%s disconnected", conn.username)
-        # Clean up per-pair buckets for this user so they don't accumulate forever
-        stale = [k for k in self._privmsg_pairs if conn.username in k]
-        for k in stale:
-            del self._privmsg_pairs[k]
-
-        # Notify room of real disconnect (no "reason" field → client clears pairwise)
+        logger.info("[%s…] disconnected", conn.inbox_token[:8])
+        for ph in self._token_pair_hashes.pop(conn.inbox_token, set()):
+            self._privmsg_pairs.pop(ph, None)
+            for s in self._token_pair_hashes.values():
+                s.discard(ph)
+        # CVE-NE-014: prune empty room history
+        if conn.room not in (c.room for c in self._clients.values()):
+            self._history.pop(conn.room, None)
         await self._broadcast_room(conn.room, {
-            "type":     "system",
-            "event":    "leave",
-            "username": conn.username,
-            "room":     conn.room,
-            "ts":       _now_ts(),
-        }, b"", exclude=conn.username)
+            "type": "system", "event": "leave",
+            "inbox_token": conn.inbox_token, "room": conn.room, "ts": _now_ts(),
+        }, b"", exclude=conn.inbox_token)
 
-    # ------------------------------------------------------------------
-    # Heartbeat — asyncio.sleep is true idle, zero CPU
-    # ------------------------------------------------------------------
+    async def _do_broadcast_migrate(self, new_port: int) -> None:
+        header = {"type": "system", "event": "migrate", "port": new_port, "ts": _now_ts()}
+        logger.info("Broadcasting migrate → bore.pub:%d to %d clients", new_port, len(self._clients))
+        for conn in list(self._clients.values()):
+            await conn.send(header)
 
     async def _heartbeat_loop(self) -> None:
         while True:
             await asyncio.sleep(self.heartbeat_interval)
             dead = []
-            for username, conn in list(self._clients.items()):
-                ok = await conn.send({"type": "heartbeat", "ts": _now_ts()})
-                if not ok:
+            for conn in list(self._clients.values()):
+                if not await conn.send({"type": "heartbeat", "ts": _now_ts()}):
                     dead.append(conn)
             for conn in dead:
                 await self._disconnect(conn)
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
 def _now_ts() -> str:
     return time.strftime("%H:%M:%S")
+
+
+class _null_context:
+    async def __aenter__(self): return self
+    async def __aexit__(self, *_): pass

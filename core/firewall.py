@@ -145,21 +145,15 @@ def _sudo_run(cmd: list) -> bool:
     r = subprocess.run(["sudo", "-n"] + cmd, capture_output=True, text=True)
     if r.returncode == 0:
         return True
-    # Fall back to interactive sudo — warn the user clearly before the prompt
-    # appears so they know it is the NoEyes firewall module asking, not something
-    # unexpected.  We also apply a timeout so CI/service environments don't hang.
+    # Fall back to interactive sudo — warn the user so they know what's asking.
     print(
         "  [fw] Firewall rule requires sudo — you may be prompted for your password.\n"
-        "       (NoEyes is trying to run: sudo " + " ".join(cmd) + ")\n"
-        "       This will time out in 30 seconds if no input is received.",
+        "       (NoEyes is trying to run: sudo " + " ".join(cmd) + ")",
         flush=True,
     )
     try:
-        r2 = subprocess.run(["sudo"] + cmd, timeout=30)
+        r2 = subprocess.run(["sudo"] + cmd)
         return r2.returncode == 0
-    except subprocess.TimeoutExpired:
-        print("  [fw] sudo prompt timed out — firewall rule skipped.", flush=True)
-        return False
     except Exception:
         return False
 
@@ -256,7 +250,10 @@ def check_stale() -> None:
     """
     Called at startup.  Reads the state file and for each port that was
     recorded as open (meaning the server crashed or was force-killed before
-    it could clean up), asks the user if they want to close it now.
+    it could clean up), asks the user what to do:
+      a — close all
+      s — close selected (comma-separated numbers)
+      n — leave them open
     """
     try:
         s = _load_state()
@@ -264,19 +261,30 @@ def check_stale() -> None:
         if not stale:
             return
 
-        print(f"\n  [fw] Found {len(stale)} firewall port(s) left open from a previous session:")
-        for p in stale:
-            print(f"       • port {p}")
+        print(f"\n  [fw] {len(stale)} firewall port(s) left open from a previous session:")
+        for i, p in enumerate(stale, 1):
+            print(f"       {i})  port {p}")
+
+        print("\n       a = close all   s = close selected   n = leave open")
 
         try:
-            answer = input("\n  Close them now? [Y/n]: ").strip().lower()
+            answer = input("\n  Choice [a/s/n]: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             answer = "n"
 
-        if answer in ("", "y", "yes"):
+        if answer in ("a", ""):
             for p in stale:
                 close_port(p)
+        elif answer == "s":
+            try:
+                sel_raw = input("  Close port numbers (e.g. 1,3): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                sel_raw = ""
+            for part in sel_raw.split(","):
+                part = part.strip()
+                if part.isdigit() and 1 <= int(part) <= len(stale):
+                    close_port(stale[int(part) - 1])
         else:
-            print("  [fw] Skipped — ports remain open. Run again to be asked next time.")
+            print("  [fw] Skipped — ports remain open. You will be asked again next run.")
     except Exception as e:
         print(f"  [fw] Stale check skipped: {e}")

@@ -38,7 +38,7 @@ import argparse, hashlib, json, os, shutil, sys, tempfile, urllib.request
 # which the repo owner keeps offline.
 # To rotate the key: update this constant and re-sign all manifests with the
 # new private key using gen_manifest.py.
-RELEASE_PUBKEY_HEX = "22942493dda8680355434ad623b707db2fd40a4656d40b1d13288bef433f8654"
+RELEASE_PUBKEY_HEX = "4773915d6e71a3509659cbc579ddb606a72a20e5ade65bac16f459e7c7c083d3"
 
 from pathlib import Path
 
@@ -53,7 +53,7 @@ MANIFEST_FILE = "manifest.json"
 
 TOOL_FILES = [
     # entry points
-    "noeyes.py", "update.py", "gen_manifest.py",
+    "noeyes.py", "update.py", "setup_discovery.py",
     # core package
     "core/__init__.py",
     "core/encryption.py", "core/identity.py", "core/utils.py",
@@ -68,15 +68,10 @@ TOOL_FILES = [
     "install/__init__.py",
     "install/install.sh", "install/install.ps1",
     "install/install.bat", "install/install.py",
-    # tests
-    "tests/__init__.py",
-    "tests/selftest.py",
-    "tests/test_launch_windows.py", "tests/test_utils_windows.py",
     # docs
     "docs/README.md", "docs/CHANGELOG.md", "docs/CONNECTION_GUIDE.md",
     # misc
-    "requirements.txt", "manifest.json", "noeyes_config.json.example",
-    "setup_firewall.sh", "demo.svg",
+    "requirements.txt",
     # sfx
     "sfx/diskette.mp3", "sfx/crt.mp3", "sfx/logo.mp3",
 ]

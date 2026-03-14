@@ -105,12 +105,99 @@ def _get_username(cfg: dict) -> str:
     return uname
 
 
-def _start_bore(port: int) -> None:
+# ── Bore port discovery ───────────────────────────────────────────────────────
+# When bore.pub kills a tunnel and the server restarts with a new port,
+# clients need to find the new port without being told manually.
+# We use keyvalue.immanuel.co — a free, fully anonymous key-value REST API.
+# An app-key is auto-provisioned on first use with a single GET request
+# (no email, no account, no auth) and cached in ~/.noeyes/discovery_appkey.
+# The lookup key is derived from the shared group key so only people with
+# the key file know which URL to check.
+
+_KV_BASE       = "https://keyvalue.immanuel.co/api/KeyVal"
+_KV_APPKEY_CACHE = "~/.noeyes/discovery_appkey"
+
+
+def _get_or_create_appkey() -> str:
     """
-    Launch bore in background and print the public address once it appears.
+    Return the cached app-key, creating one if needed.
+    App-key is an 8-char alphanumeric string returned by a single GET.
+    Cached at ~/.noeyes/discovery_appkey.
+    """
+    import urllib.request as _ur
+    from pathlib import Path as _P
+    import re as _re
+
+    cache = _P(_KV_APPKEY_CACHE).expanduser()
+    try:
+        ak = cache.read_text().strip()
+        if ak and _re.match(r'^[A-Za-z0-9]{6,}', ak):
+            return ak
+    except Exception:
+        pass
+
+    try:
+        with _ur.urlopen(f"{_KV_BASE}/GetAppKey", timeout=10) as r:
+            ak = r.read().decode().strip().strip('"')
+        if not ak:
+            raise ValueError("empty response")
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(ak)
+        # CVE-NE-011 FIX: restrict permissions so other local users cannot read
+        # the app-key and overwrite the discovery record.
+        import sys as _sys2
+        if _sys2.platform != "win32":
+            try:
+                cache.chmod(0o600)
+            except OSError:
+                pass
+        return ak
+    except Exception as e:
+        print(utils.cgrey(f"[discovery] could not provision app-key: {e}"), flush=True)
+        return ""
+
+
+def _discovery_post(key: str, port: str) -> None:
+    """Post the current bore port to the discovery service."""
+    import urllib.request as _ur
+    try:
+        ak = _get_or_create_appkey()
+        if not ak:
+            return
+        url = f"{_KV_BASE}/UpdateValue/{ak}/{key}/{port}"
+        req = _ur.Request(url, data=b"", method="POST")
+        with _ur.urlopen(req, timeout=8):
+            pass
+        print(utils.cinfo(f"[discovery] port {port} posted — clients will find new address automatically."), flush=True)
+    except Exception as e:
+        print(utils.cgrey(f"[discovery] post failed: {e}"), flush=True)
+
+
+def _discovery_get(key: str) -> str:
+    """Fetch the current bore port from the discovery service. Returns port string or ''."""
+    import urllib.request as _ur
+    try:
+        ak = _get_or_create_appkey()
+        if not ak:
+            return ""
+        with _ur.urlopen(f"{_KV_BASE}/GetValue/{ak}/{key}", timeout=8) as r:
+            val = r.read().decode().strip().strip('"')
+            return val if val and val != "null" else ""
+    except Exception:
+        return ""
+
+
+def _start_bore(port: int, discovery_key: str = "", no_discovery: bool = False) -> None:
+    """
+    Launch bore in background and keep it alive.
+
+    Watches for unexpected death and restarts immediately.
+    When a new port is assigned, posts it to the discovery service so
+    clients can find it automatically on reconnect.
     Silently skips if bore is not installed.
     """
     import subprocess, threading, shutil, re
+    _this_file = __file__  # capture before entering threads where __file__ is unavailable
 
     import sys as _sys, os as _os
     from pathlib import Path as _Path
@@ -132,83 +219,336 @@ def _start_bore(port: int) -> None:
         ))
         return
 
-    def _run():
-        import time as _time
-        # On Windows: use STARTUPINFO to hide the bore console window
-        # WITHOUT using CREATE_NO_WINDOW or DETACHED_PROCESS which can
-        # cause Windows Terminal to minimize the parent window.
-        kwargs = {}
+    import time as _time
+
+    def _make_kwargs():
+        """Return platform-specific Popen kwargs (hides console on Windows)."""
+        kw = {}
         if _sys.platform == "win32":
             si = subprocess.STARTUPINFO()
             si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            si.wShowWindow = 0  # SW_HIDE
-            kwargs["startupinfo"] = si
+            si.wShowWindow = 0
+            kw["startupinfo"] = si
+        return kw
 
-        try:
-            proc = subprocess.Popen(
-                [bore_cmd, "local", str(port), "--to", "bore.pub"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,   # separate stderr so we can log errors
-                text=True,
-                **kwargs,
-            )
+    def _launch_tunnel():
+        """
+        Start one bore process.
+        Returns (proc, assigned_port_str) once bore.pub has assigned a port,
+        or (proc, None) if we couldn't read a port within 15 s (bore failed).
+        Stdout/stderr draining threads are started automatically.
+        """
+        proc = subprocess.Popen(
+            [bore_cmd, "local", str(port), "--to", "bore.pub"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            **_make_kwargs(),
+        )
 
-            # Drain stderr in a separate thread so it never blocks bore
-            def _drain_stderr():
-                for err_line in proc.stderr:
-                    err_line = err_line.strip()
-                    if err_line:
-                        print(utils.cgrey(f"[bore] {err_line}"), flush=True)
-            threading.Thread(target=_drain_stderr, daemon=True).start()
+        # Drain stderr in a background thread so the pipe never fills.
+        def _drain_stderr():
+            for err_line in proc.stderr:
+                err_line = err_line.strip()
+                if err_line:
+                    print(utils.cgrey(f"[bore] {err_line}"), flush=True)
+        threading.Thread(target=_drain_stderr, daemon=True).start()
 
-            _root = str(_Path(__file__).parent)
-            _key = "./chat.key"
-            if (_Path(__file__).parent / "ui" / "chat.key").exists() and not (_Path(__file__).parent / "chat.key").exists():
-                _key = "./ui/chat.key"
+        # Read stdout lines until we see the assigned port or the process dies.
+        # We must drain stdout in a thread too (so the pipe never blocks), but
+        # we also need the first port line — use a queue to hand it back.
+        import queue as _queue
+        port_q: "_queue.Queue[str | None]" = _queue.Queue()
+        announced_port: list = [None]   # shared with drain thread
 
-            announced = False
+        def _drain_stdout():
             for line in proc.stdout:
                 m = re.search(r"bore\.pub:(\d+)", line)
-                if m and not announced:
-                    p = m.group(1)
-                    announced = True
-                    print(utils.cinfo(
-                        f"\n  ┌─ bore tunnel active ─────────────────────────────────────────\n"
-                        f"  │  address : bore.pub:{p}\n"
-                        f"  │\n"
-                        f"  │  Share this with anyone who wants to connect:\n"
-                        f"  │\n"
-                        f"  │    1. cd {_root}\n"
-                        f"  │    2. python noeyes.py --connect bore.pub --port {p} --key-file {_key}\n"
-                        f"  │\n"
-                        f"  │  They also need a copy of the key file ({_key})\n"
-                        f"  └──────────────────────────────────────────────────────────────\n"
-                    ), flush=True)
-                # Keep draining stdout — never break, so the pipe never fills
-                # and Windows doesn't kill bore due to a blocked pipe buffer.
+                if m and announced_port[0] is None:
+                    announced_port[0] = m.group(1)
+                    port_q.put(announced_port[0])
+                # Keep draining forever so the pipe never fills.
+            port_q.put(None)   # process stdout closed
 
-            # Loop exited — bore process died
-            code = proc.wait()
-            print(utils.cwarn(f"[bore] tunnel closed (exit {code}) — restarting in 5s…"), flush=True)
-            _time.sleep(5)
+        threading.Thread(target=_drain_stdout, daemon=True).start()
 
-        except Exception as e:
-            print(utils.cgrey(f"[bore] failed to start: {e}"), flush=True)
+        try:
+            assigned = port_q.get(timeout=15)   # wait up to 15 s for bore.pub
+        except _queue.Empty:
+            assigned = None
 
-    def _run_with_restart():
-        """Keep bore alive — restart it if it crashes."""
+        return proc, assigned
+
+    def _print_banner(p: str) -> None:
+        _root = str(_Path(_this_file).parent)
+        _key  = "./chat.key"
+        if (_Path(_this_file).parent / "ui" / "chat.key").exists() and \
+                not (_Path(_this_file).parent / "chat.key").exists():
+            _key = "./ui/chat.key"
+        disc_line = (
+            f"  │  discovery : disabled (--no-discovery)\n"
+            if no_discovery else
+            f"  │  discovery : enabled — clients find new port automatically\n"
+        )
+        print(utils.cinfo(
+            f"\n  ┌─ bore tunnel active ─────────────────────────────────────────\n"
+            f"  │  address  : bore.pub:{p}\n"
+            f"{disc_line}"
+            f"  │\n"
+            f"  │  Share this with anyone who wants to connect:\n"
+            f"  │\n"
+            f"  │    1. cd {_root}\n"
+            f"  │    2. python noeyes.py --connect bore.pub --port {p} --key-file {_key}\n"
+            f"  │\n"
+            f"  │  They also need a copy of the key file ({_key})\n"
+            f"  └──────────────────────────────────────────────────────────────\n"
+        ), flush=True)
+
+    def _migration_loop():
+        """
+        Bore lifecycle loop — start tunnel, watch for unexpected death, restart.
+        Posts the current port to the discovery service on each (re)start
+        so clients can find the new port automatically.
+        """
+        current_proc = None
+
         while True:
-            _run()
+            # ── Launch / restart tunnel ───────────────────────────────────
+            if current_proc is None or current_proc.poll() is not None:
+                if current_proc is not None:
+                    code = current_proc.poll()
+                    print(utils.cwarn(
+                        f"[bore] tunnel died (exit {code}) — restarting…"
+                    ), flush=True)
+                try:
+                    proc, assigned = _launch_tunnel()
+                except Exception as e:
+                    print(utils.cgrey(f"[bore] failed to start: {e}"), flush=True)
+                    _time.sleep(5)
+                    continue
 
-    threading.Thread(target=_run_with_restart, daemon=True).start()
+                if assigned is None:
+                    print(utils.cwarn("[bore] timed out waiting for port — retrying in 5s…"), flush=True)
+                    try: proc.kill()
+                    except Exception: pass
+                    _time.sleep(5)
+                    continue
+
+                current_proc = proc
+                _print_banner(assigned)
+                if not no_discovery and discovery_key:
+                    _discovery_post(discovery_key, assigned)
+                else:
+                    print(utils.cgrey(
+                        f"[bore] new port: {assigned} — discovery disabled, share address manually."
+                    ), flush=True)
+
+            # ── Poll for unexpected death every 100 ms ────────────────────
+            _time.sleep(0.1)
+
+    threading.Thread(target=_migration_loop, daemon=True).start()
+
+
+def _check_port_available(port: int) -> "int | bool":
+    """
+    Check if *port* is free to bind.
+    If already in use, shows who owns it and asks:
+      k  — kill that process and keep the port
+      p  — pick a different port
+      q  — quit
+    Returns True (port free), int (new port chosen), or False (quit).
+    Cross-platform: Windows, Linux, macOS.
+    """
+    import socket as _sock
+    import subprocess as _sp
+    import re as _re
+    import sys as _sys
+    import time as _t
+
+    def _is_free(p: int) -> bool:
+        with _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM) as s:
+            s.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+            try:
+                s.bind(("0.0.0.0", p))
+                return True
+            except OSError:
+                return False
+
+    def _who_owns(p: int) -> "tuple[str, str]":
+        """Return (display_str, pid_str) for the process bound to *p*, or ('','')."""
+        pid = ""
+        cmd = ""
+        try:
+            if _sys.platform == "win32":
+                # netstat on Windows: "  TCP  0.0.0.0:5000  ...  LISTENING  1234"
+                out = _sp.check_output(
+                    ["netstat", "-ano", "-p", "TCP"],
+                    stderr=_sp.DEVNULL, text=True
+                )
+                for line in out.splitlines():
+                    if f":{p} " in line and "LISTEN" in line:
+                        parts = line.split()
+                        pid = parts[-1] if parts[-1].isdigit() else ""
+                        break
+                if pid:
+                    out2 = _sp.check_output(
+                        ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                        stderr=_sp.DEVNULL, text=True
+                    ).strip()
+                    if out2:
+                        cmd = out2.split(",")[0].strip('"')
+            else:
+                # Try ss first (Linux), fall back to netstat (macOS/older Linux/BSD)
+                for argv in (
+                    ["ss", "-tlnp", f"sport = :{p}"],
+                    ["netstat", "-tlnp"],
+                    ["netstat", "-anp", "tcp"],   # macOS
+                ):
+                    try:
+                        out = _sp.check_output(argv, stderr=_sp.DEVNULL, text=True)
+                    except FileNotFoundError:
+                        continue
+                    for line in out.splitlines():
+                        if str(p) not in line:
+                            continue
+                        # ss style: pid=1234
+                        m = _re.search(r'pid=(\d+)', line)
+                        if m:
+                            pid = m.group(1)
+                            break
+                        # netstat style: last column is PID/cmd
+                        m2 = _re.search(r' (\d+)/(\S+)\s*$', line)
+                        if m2:
+                            pid, cmd = m2.group(1), m2.group(2)
+                            break
+                    if pid:
+                        break
+                if pid and not cmd:
+                    try:
+                        cmd = _sp.check_output(
+                            ["ps", "-p", pid, "-o", "comm="],
+                            stderr=_sp.DEVNULL, text=True
+                        ).strip()
+                    except Exception:
+                        cmd = "?"
+        except Exception:
+            pass
+        if pid:
+            label = f"PID {pid}" + (f" ({cmd})" if cmd else "")
+            return label, pid
+        return "", ""
+
+    def _kill_pid(pid: str) -> bool:
+        """Terminate a process by PID. Cross-platform."""
+        try:
+            if _sys.platform == "win32":
+                _sp.run(["taskkill", "/F", "/PID", pid],
+                        capture_output=True)
+                _t.sleep(0.4)
+            else:
+                import os as _os, signal as _sig
+                ipid = int(pid)
+                _os.kill(ipid, _sig.SIGTERM)
+                _t.sleep(0.8)
+                try:
+                    _os.kill(ipid, 0)   # still alive?
+                    _os.kill(ipid, _sig.SIGKILL)
+                    _t.sleep(0.3)
+                except ProcessLookupError:
+                    pass
+        except Exception:
+            pass
+        return True   # best-effort; caller checks _is_free()
+
+    if _is_free(port):
+        return True
+
+    owner_str, pid = _who_owns(port)
+    print(utils.cwarn(
+        f"\n[!] Port {port} is already in use"
+        + (f" — {owner_str}" if owner_str else "") + ".\n"
+        f"    What would you like to do?\n"
+        f"      k  — kill the process holding the port\n"
+        f"      p  — choose a different port\n"
+        f"      q  — quit\n"
+    ))
+
+    while True:
+        try:
+            choice = input("  Your choice [k/p/q]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            choice = "q"
+
+        if choice == "q":
+            print(utils.cwarn("[!] Aborted."))
+            return False
+
+        elif choice == "k":
+            if not pid:
+                _, pid = _who_owns(port)
+            if pid:
+                _kill_pid(pid)
+                if _is_free(port):
+                    print(utils.cinfo(f"[+] Process {pid} terminated — port {port} is now free."))
+                    return True
+                print(utils.cwarn(f"[!] Port {port} still occupied after kill attempt."))
+            else:
+                print(utils.cwarn("[!] Could not determine PID — kill manually or choose 'p'."))
+
+        elif choice == "p":
+            while True:
+                try:
+                    raw = input("  New port number: ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print(utils.cwarn("[!] Aborted."))
+                    return False
+                if raw.isdigit() and 1 <= int(raw) <= 65535:
+                    np = int(raw)
+                    if _is_free(np):
+                        return np
+                    who2, _ = _who_owns(np)
+                    print(utils.cwarn(
+                        f"[!] Port {np} is also in use"
+                        + (f" ({who2})" if who2 else "") + " — try another."
+                    ))
+                else:
+                    print(utils.cwarn("[!] Enter a number between 1 and 65535."))
+        else:
+            print("  Please enter k, p, or q.")
 
 
 def run_server(cfg: dict) -> None:
-    import atexit, signal as _signal
+    import atexit, signal as _signal, hashlib as _hl
     from network.server import NoEyesServer
+
+    # ── Port availability check ───────────────────────────────────────────────
+    _avail = _check_port_available(cfg["port"])
+    if _avail is False:
+        sys.exit(0)
+    if isinstance(_avail, int) and not isinstance(_avail, bool):
+        cfg["port"] = _avail
 
     _port       = cfg["port"]
     _no_fw      = cfg.get("no_firewall", False)
+
+    # Derive discovery key from the shared group key so server and clients
+    # independently compute the same lookup key without any coordination.
+    # Only attempt this if a key file or key was actually provided —
+    # the server is a blind forwarder and does not require the key to run.
+    _disc_key = ""
+    if not cfg.get("no_discovery") and (cfg.get("key_file") or cfg.get("key")):
+        try:
+            _fernet, _key_bytes = _resolve_fernet(cfg)
+            _disc_key = _hl.sha256(_key_bytes).hexdigest()[:24]
+        except SystemExit:
+            raise
+        except Exception:
+            _disc_key = ""
+    elif not cfg.get("no_discovery") and not (cfg.get("key_file") or cfg.get("key")):
+        print(utils.cgrey(
+            "[discovery] no key file provided — port discovery disabled.\n"
+            "            Pass --key-file to enable automatic port discovery."
+        ))
 
     # Open firewall rule for the server port (skip if --no-firewall)
     if not _no_fw:
@@ -219,7 +559,16 @@ def run_server(cfg: dict) -> None:
     def _sig_handler(signum, frame):
         if not _no_fw:
             fw.close_port(_port)
-        sys.exit(0)
+        # Stop the asyncio event loop cleanly — sys.exit() inside a signal
+        # handler races with asyncio's internal exception handling and can
+        # get swallowed, leaving the server running.  Stopping the loop
+        # makes serve_forever() return, which unwinds _main() and lets
+        # asyncio.run() exit normally.
+        loop = getattr(server, "_loop", None)
+        if loop and loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
+        else:
+            sys.exit(0)
     try:
         _signal.signal(_signal.SIGINT,  _sig_handler)
         _signal.signal(_signal.SIGTERM, _sig_handler)
@@ -248,7 +597,7 @@ def run_server(cfg: dict) -> None:
             f"       python noeyes.py --connect <YOUR-IP> --port {cfg['port']} --key-file ./chat.key"
         ))
     else:
-        _start_bore(cfg["port"])
+        _start_bore(cfg["port"], discovery_key=_disc_key, no_discovery=cfg.get("no_discovery", False))
 
     server.run()
 
@@ -280,6 +629,7 @@ def _resolve_tls_for_client(host: str, port: int, no_tls: bool) -> tuple:
 
 
 def run_client(cfg: dict) -> None:
+    import hashlib as _hl
     from network.client import NoEyesClient
 
     group_fernet, group_key_bytes = _resolve_fernet(cfg)
@@ -287,6 +637,8 @@ def run_client(cfg: dict) -> None:
 
     no_tls = cfg.get("no_tls", False)
     tls, tls_cert = _resolve_tls_for_client(cfg["connect"], cfg["port"], no_tls)
+
+    disc_key = _hl.sha256(group_key_bytes).hexdigest()[:24] if group_key_bytes else ""
 
     client = NoEyesClient(
         host=cfg["connect"],
@@ -300,6 +652,8 @@ def run_client(cfg: dict) -> None:
         tls=tls,
         tls_cert=tls_cert,
         tls_tofu_path=TLS_TOFU_PATH,
+        discovery_key=disc_key,
+        no_discovery=cfg.get("no_discovery", False),
     )
     client.run()
 

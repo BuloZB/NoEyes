@@ -44,6 +44,21 @@ _PBKDF2_SALT_LEGACY = b"noeyes_static_salt_v1"  # kept for backward-compat only
 _PBKDF2_ITERATIONS   = 390_000
 
 
+def _restrict_perms(p: Path) -> None:
+    """
+    Set owner-only (0o600) permissions on *p*.
+    Cross-OS: silently skips on Windows where chmod is a no-op on most
+    filesystems (permissions are managed via ACLs).
+    """
+    import sys as _sys
+    if _sys.platform == "win32":
+        return
+    try:
+        p.chmod(0o600)
+    except OSError:
+        pass
+
+
 def derive_fernet_key(passphrase: str, salt: bytes | None = None) -> tuple:
     """
     Derive a Fernet instance from a shared passphrase using PBKDF2-HMAC-SHA256.
@@ -117,7 +132,7 @@ def generate_key_file(path: str) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     key = Fernet.generate_key()
     p.write_bytes(key)
-    p.chmod(0o600)
+    _restrict_perms(p)
     print(f"[keygen] New Fernet key written to {p}")
 
 
@@ -145,7 +160,7 @@ def derive_and_save_key_file(path: str, passphrase: str) -> Fernet:
     p = Path(path).expanduser()
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps({"v": 2, "key": raw_key, "salt": salt.hex()}))
-    p.chmod(0o600)
+    _restrict_perms(p)
     key_bytes = base64.urlsafe_b64decode(raw_key)
     return Fernet(raw_key.encode()), key_bytes
 
@@ -236,9 +251,20 @@ def load_identity(path: str) -> tuple[bytes, bytes]:
             import sys
             for attempt in range(3):
                 id_pass = _prompt_identity_password(confirm=False)
-                enc_fernet, _ = derive_fernet_key(id_pass)
+                # CVE-NE-002 FIX: use the per-file salt if present; fall back to
+                # the legacy static salt for old files, then immediately re-save
+                # with a fresh random salt so the file is migrated on first unlock.
+                stored_salt_hex = data.get("id_salt")
+                if stored_salt_hex:
+                    salt = bytes.fromhex(stored_salt_hex)
+                else:
+                    salt = None  # legacy: uses _PBKDF2_SALT_LEGACY internally
+                enc_fernet, _ = derive_fernet_key(id_pass, salt=salt)
                 try:
                     sk_bytes = enc_fernet.decrypt(data["sk_enc"].encode())
+                    if not stored_salt_hex:
+                        # Migrate: re-save immediately with a fresh random salt
+                        _save_identity_with_password(path, sk_bytes, id_pass)
                     return sk_bytes, vk_bytes
                 except Exception:
                     remaining = 2 - attempt
@@ -284,13 +310,23 @@ def _save_identity_with_password(path: str, sk_bytes: bytes, password: str) -> N
         serialization.PublicFormat.Raw,
     )
     if password:
-        enc_fernet, _ = derive_fernet_key(password)
+        # CVE-NE-002 FIX: generate a random 32-byte salt per identity file.
+        # The old code used a global static salt (_PBKDF2_SALT_LEGACY), meaning
+        # one rainbow table covers every stolen identity file ever created.
+        # A random per-file salt makes each file an independent cracking target.
+        id_salt = os.urandom(32)
+        enc_fernet, _ = derive_fernet_key(password, salt=id_salt)
         sk_enc = enc_fernet.encrypt(sk_bytes).decode()
-        payload = {"encrypted": True, "sk_enc": sk_enc, "vk_hex": vk_bytes.hex()}
+        payload = {
+            "encrypted": True,
+            "sk_enc": sk_enc,
+            "vk_hex": vk_bytes.hex(),
+            "id_salt": id_salt.hex(),   # stored alongside encrypted key
+        }
     else:
         payload = {"encrypted": False, "sk_hex": sk_bytes.hex(), "vk_hex": vk_bytes.hex()}
     p.write_text(json.dumps(payload))
-    p.chmod(0o600)
+    _restrict_perms(p)
 
 
 def sign_message(sk_bytes: bytes, data: bytes) -> bytes:
@@ -445,8 +481,8 @@ def generate_tls_cert(cert_path: str, key_path: str) -> None:
         _ser.PrivateFormat.TraditionalOpenSSL,
         _ser.NoEncryption(),
     ))
-    cert_p.chmod(0o600)
-    key_p.chmod(0o600)
+    _restrict_perms(cert_p)
+    _restrict_perms(key_p)
 
 
 def get_tls_fingerprint(cert_path: str) -> str:
@@ -478,4 +514,4 @@ def save_tls_tofu(store: dict, tofu_path: str) -> None:
     p = Path(tofu_path).expanduser()
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(store, indent=2))
-    p.chmod(0o600)
+    _restrict_perms(p)

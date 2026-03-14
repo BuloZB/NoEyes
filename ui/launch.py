@@ -16,6 +16,12 @@ import shutil
 import json
 from pathlib import Path
 
+# Make sure the project root (parent of ui/) is on the path so core.firewall works
+_PROJECT_ROOT = str(Path(__file__).parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+from core import firewall as fw
+
 # Compatibility: termios / tty only exist on Unix.
 # On Windows we fall back to msvcrt for raw keypress reading.
 try:
@@ -453,6 +459,18 @@ def server_flow(deps: dict):
     except ValueError:
         port = 5000
 
+    history_raw = input_line(f"  {bo('Message history size')} {gy('(lines replayed to new clients)')}", "50")
+    try:
+        history_size = max(0, int(history_raw))
+    except ValueError:
+        history_size = 50
+
+    rate_raw = input_line(f"  {bo('Rate limit')} {gy('(messages per client per minute)')}", "30")
+    try:
+        rate_limit = max(1, int(rate_raw))
+    except ValueError:
+        rate_limit = 30
+
     if os.environ.get("NOEYES_NO_BORE"):
         use_bore = False
     elif deps["bore"]:
@@ -462,6 +480,28 @@ def server_flow(deps: dict):
         print(f"\n  {gy('bore not installed — LAN/local connections only.')}")
         print(f"  {gy('Install bore for internet access: https://github.com/ekzhang/bore')}")
         use_bore = False
+
+    use_discovery = True
+    if use_bore:
+        clear()
+        print(LOGO)
+        disc_explain = [
+            "When bore.pub kills the tunnel and the server restarts with a",
+            "new port, clients cannot reconnect without the new address.",
+            "",
+            f"  {gr('With discovery enabled')} NoEyes automatically posts the current",
+            "  bore port to a free anonymous key-value store so clients",
+            "  reconnect without any manual action.",
+            "",
+            "  An app-key is provisioned automatically on first run —",
+            "  no email, no account, no setup needed.",
+            "",
+            "  Disable only if you want no external HTTP calls.",
+        ]
+        print(box("Bore Port Discovery (recommended)", disc_explain, colour=cy))
+        print()
+        use_discovery = confirm(f"  {bo('Enable automatic port discovery?')}", True)
+
 
     # Firewall rule — optional, with explanation
     clear()
@@ -487,8 +527,12 @@ def server_flow(deps: dict):
     # Summary box
     clear()
     print(LOGO)
-    bore_line = gr("\u2714  bore tunnel enabled (internet accessible)") if use_bore else gy("\u2014  LAN / local only (--no-bore)")
-    fw_line   = gr(f"\u2714  rule will be added for port {port}") if open_firewall else gy(f"\u2014  skipped (--no-firewall)")
+    bore_line = gr("✔  bore tunnel enabled (internet accessible)") if use_bore else gy("—  LAN / local only (--no-bore)")
+    if use_bore and use_discovery:
+        bore_line += gr("  · auto-discovery on")
+    elif use_bore:
+        bore_line += yl("  · auto-discovery off (--no-discovery)")
+    fw_line   = gr(f"✔  rule will be added for port {port}") if open_firewall else gy(f"—  skipped (--no-firewall)")
     print(box("Server Ready to Start", [
         f"Port       :  {bo(str(port))}",
         f"Tunnel     :  {bore_line}",
@@ -504,9 +548,24 @@ def server_flow(deps: dict):
 
     root = Path(__file__).parent.parent
     noeyes = root / "noeyes.py"
-    cmd = [sys.executable, str(noeyes), "--server", "--port", str(port)]
+
+    # Write server-tuning values to a temp config file (no CLI flags exist for them)
+    import tempfile, json as _json
+    _cfg_data = {"history_size": history_size, "rate_limit_per_minute": rate_limit}
+    _tmp_cfg  = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", prefix="noeyes_launch_", delete=False
+    )
+    _json.dump(_cfg_data, _tmp_cfg)
+    _tmp_cfg.close()
+
+    cmd = [sys.executable, str(noeyes), "--server", "--port", str(port),
+           "--config", _tmp_cfg.name]
+    if key_path:
+        cmd.extend(["--key-file", str(key_path)])
     if not use_bore:
         cmd.append("--no-bore")
+    if use_bore and not use_discovery:
+        cmd.append("--no-discovery")
     if not open_firewall:
         cmd.append("--no-firewall")
     if os.environ.get("NOEYES_NO_TLS"):
@@ -521,6 +580,15 @@ def server_flow(deps: dict):
             input("\n  Press Enter to return to menu...")
     except KeyboardInterrupt:
         pass
+    finally:
+        # Clean up the temp config file
+        try:
+            import os as _os
+            _os.unlink(_tmp_cfg.name)
+        except Exception:
+            pass
+        # Surface stale port cleanup after server exits
+        fw.check_stale()
 
 # ── Client connection flow ────────────────────────────────────────────────────
 
@@ -755,6 +823,9 @@ def main():
 
     deps = check_deps()
 
+    # Surface stale NoEyes ports from any previous crashed session
+    fw.check_stale()
+
     # If cryptography is missing, offer to install it before showing menu
     if not deps["cryptography"]:
         clear()
@@ -814,6 +885,7 @@ def main():
 
     clear()
     show_cursor()
+    fw.check_stale()
     print(f"\n  {gy('Goodbye.')}\n")
 
 

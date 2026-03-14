@@ -54,8 +54,20 @@ _TYPE_MAP = {
                ".pptx", ".ppt", ".csv", ".odt", ".rtf", ".pages"},
 }
 
-FILE_CHUNK_SIZE = 32 * 1024 * 1024  # 32 MB — 1 frame per 5MB file, fastest over bore tunnels
-# Chunks use AES-256-GCM (hardware-accelerated, ~800 MB/s) not Fernet (~90 MB/s).
+FILE_CHUNK_SIZE = 512 * 1024  # 512 KB per wire frame.
+# WHY 64 KB (not the old 4 MB):
+#   1. SENDER side: _send_lo holds _sock_lock for one sendall() call. At 1 MB/s
+#      bore bandwidth a 4 MB sendall blocks for ~4 seconds — during that window
+#      the input thread cannot acquire the lock, so pressing Enter appears to do
+#      nothing.  64 KB → ≤ 64 ms at 1 MB/s, imperceptible to the user.
+#   2. RECEIVER side: recv_frame() reads the full payload before dispatching.
+#      With 4 MB payloads, all incoming frames (chat, system, DH…) are blocked
+#      for the duration of reading a single chunk.  64 KB means the recv loop
+#      can process other frame types between every chunk.
+#   3. Priority interleaving: hi-priority chat/control frames queued while a
+#      chunk is in-flight get the socket between consecutive 64 KB chunks.
+# Throughput impact: negligible — AES-256-GCM processes 64 KB in ~0.08 ms
+# (800 MB/s hardware path) and TCP coalesces small writes in the kernel buffer.
 # Binary frame: [4B index BE][4B tid_len BE][tid bytes][nonce(12)+ct+tag(16)]
 
 
@@ -170,6 +182,8 @@ class NoEyesClient:
         tls: bool          = False,
         tls_cert: str      = "",        # path to CA cert (manual override)
         tls_tofu_path: str = "~/.noeyes/tls_fingerprints.json",
+        discovery_key: str = "",        # derived from group key — used to find new bore port
+        no_discovery: bool = False,     # skip external discovery HTTP calls
     ):
         self.host          = host
         self.port          = port
@@ -189,10 +203,25 @@ class NoEyesClient:
         self._tls          = tls
         self._tls_cert     = tls_cert       # CA cert path, empty = TOFU mode
         self._tls_tofu_path = tls_tofu_path
+        # Guard: only print the TLS fingerprint line once per session,
+        # not on every bore-tunnel reconnect / migration.
+        self._tls_announced: bool = False
+
+        # Port discovery — used when bore.pub kills the tunnel and the server
+        # restarts with a new port.  Clients poll the discovery service to find
+        # the new port automatically without user intervention.
+        self._discovery_key  = discovery_key
+        self._no_discovery   = no_discovery
 
         # Load / generate Ed25519 identity
         self.sk_bytes, self.vk_bytes = enc.load_identity(identity_path)
         self.vk_hex = self.vk_bytes.hex()
+
+        # Inbox token — opaque routing address derived from our vk.
+        # blake2s(vk_bytes, digest_size=16) — same formula the server uses.
+        # Peers derive our token locally from the TOFU store so no exchange needed.
+        import hashlib as _hl
+        self.inbox_token: str = _hl.blake2s(self.vk_bytes, digest_size=16).hexdigest()
 
         # TOFU store
         self.tofu_store = id_mod.load_tofu(tofu_path)
@@ -211,6 +240,17 @@ class NoEyesClient:
         self._msg_queue: dict[str, list] = {}
         # Queued outgoing file sends waiting for DH to complete
         self._file_queue: dict[str, list] = {}  # peer -> [(filepath, ...),]
+        # In-progress incoming file transfers: tid -> metadata dict
+        self._incoming_files: dict = {}
+
+        # Resume handshake state for outgoing file sends (sender side).
+        # When a bore migration interrupts a transfer, the sender retransmits
+        # file_start with the same tid.  The receiver replies with file_resume_ack
+        # telling us exactly how many chunks it already wrote (next_index).
+        # _file_resume_events: tid → threading.Event  (set when ack arrives)
+        # _file_resume_index:  tid → int              (ack's next_index value)
+        self._file_resume_events: dict[str, threading.Event] = {}
+        self._file_resume_index:  dict[str, int] = {}
 
         # Users whose pubkey didn't match our TOFU store (possible key regen or attack)
         # Messages from these users are shown with a ⚠ marker, not silently dropped.
@@ -229,13 +269,53 @@ class NoEyesClient:
         # Buffer of incoming privmsg frames that arrived before pairwise key was ready
         self._privmsg_buffer: dict[str, list] = {}
 
-        # In-progress incoming file transfers: transfer_id → {meta, chunks}
-        self._incoming_files: dict[str, dict] = {}
+        # Messages typed during a migration window or tunnel-down period —
+        # held here and flushed immediately after the new socket is ready.
+        # Each entry is (text, tag, ts) as passed to _send_chat.
+        self._pending_outbox: list = []
+
+        # Privmsgs queued while the tunnel is down, keyed by peer username.
+        # Each value is a list of (text, tag, ts).
+        self._pending_privmsg: dict[str, list] = {}
 
         self.sock: Optional[socket.socket] = None
-        self._sock_lock = threading.Lock()   # guards all socket writes
+        # Priority send queues — replace the old _sock_lock / _hi_waiting approach.
+        #
+        # WHY (bugs fixed):
+        #   _hi_waiting += 1 is a non-atomic read-modify-write; the GIL can
+        #   switch between the LOAD_ATTR and STORE_ATTR bytecodes, so two threads
+        #   racing on it produce wrong counts — the priority mechanism silently
+        #   fails and chat frames can be starved or the counter drifts negative,
+        #   causing _send_lo to spin forever.  Additionally, _send_lo held
+        #   _sock_lock for the entire duration of sendall(4 MB), blocking the
+        #   input thread at the lock and making Enter appear unresponsive.
+        #
+        # NEW design:
+        #   _send_hi_q  — high-priority: chat, control, heartbeat, DH, pubkey.
+        #                 Put items via _send(); returned immediately (non-blocking).
+        #   _send_lo_q  — low-priority: file chunks.
+        #                 Put items via _send_lo(); caller blocks on an Event until
+        #                 the sender thread processes the frame and sets the result.
+        #   _sender_loop() drains _send_hi_q completely before touching _send_lo_q,
+        #   guaranteeing chat always beats file chunks for socket access.
+        import queue as _q
+        self._send_hi_q: _q.Queue = _q.Queue()
+        self._send_lo_q: _q.Queue = _q.Queue()
         self._running = False
         self._quit    = False               # set True on intentional /quit or Ctrl+C
+        self._migrating = False             # set True on a clean bore tunnel migration
+        # Pre-set True if connecting via bore.pub so discovery works even before
+        # the first successful handshake (e.g. on initial connect or after bore dies).
+        self._using_bore = (self.host.lower() == "bore.pub")
+        # Timestamp until which join/leave chat messages are suppressed.
+        # Set for 15s when a migrate event arrives so users don't see the churn
+        # of everyone disconnecting and reconnecting during the tunnel switch.
+        self._migration_quiet_until: float = 0.0
+        # Set when a new connection is fully ready (auth_ok + pubkey announced).
+        # Cleared when a migration starts. Send threads that hit a dead socket
+        # during migration wait on this instead of failing immediately.
+        self._reconnect_event = threading.Event()
+        self._reconnect_event.set()         # starts set — no migration in progress
         self._input_thread: Optional[threading.Thread] = None
         self._recv_thread: Optional[threading.Thread]  = None
 
@@ -289,7 +369,9 @@ class NoEyesClient:
                 if der:
                     import hashlib
                     fp = hashlib.sha256(der).hexdigest()
-                    key = f"{self.host}:{self.port}"
+                    # Key on host only (not host:port) so the stored fingerprint
+                    # survives bore tunnel migrations that change the port.
+                    key = self.host
 
                     # Load TOFU store and verify / register the fingerprint
                     store = enc.load_tls_tofu(self._tls_tofu_path)
@@ -297,10 +379,12 @@ class NoEyesClient:
                         # First contact — trust and store
                         store[key] = fp
                         enc.save_tls_tofu(store, self._tls_tofu_path)
-                        utils.print_msg(utils.cok(
-                            f"[tls] New server fingerprint trusted (first contact):\n"
-                            f"      {fp[:16]}...{fp[-16:]}"
-                        ))
+                        if not self._tls_announced:
+                            utils.print_msg(utils.cok(
+                                f"[tls] New server fingerprint trusted (first contact):\n"
+                                f"      {fp[:16]}...{fp[-16:]}"
+                            ))
+                        self._tls_announced = True
                     elif store[key] != fp:
                         # Fingerprint changed — abort immediately.
                         # Continuing with a mismatched cert would let a MITM attacker
@@ -320,21 +404,160 @@ class NoEyesClient:
                         s.close()
                         return False
                     else:
-                        # Known fingerprint — silently good
-                        utils.print_msg(utils.cok(
-                            f"[tls] Encrypted  ·  {fp[:8]}...{fp[-8:]}"
-                        ))
+                        # Known fingerprint — silently good (print once per session only)
+                        if not self._tls_announced:
+                            utils.print_msg(utils.cok(
+                                f"[tls] Encrypted  ·  {fp[:8]}...{fp[-8:]}"
+                            ))
+                        self._tls_announced = True
 
             self.sock = s
             return True
-        except OSError as e:
-            utils.print_msg(utils.cerr(f"[error] Cannot connect to {self.host}:{self.port} — {e}"))
+        except OSError:
+            if self._migrating or self._using_bore:
+                # Swallow — panel spinner already shows reconnect state
+                pass
+            else:
+                utils.print_msg(utils.cerr(f"[error] Cannot connect to {self.host}:{self.port}"))
             return False
 
-    def _send(self, header: dict, payload: bytes = b"") -> bool:
-        """Thread-safe send: holds the socket write lock for the entire frame."""
-        with self._sock_lock:
-            return send_frame(self.sock, header, payload)
+    # ------------------------------------------------------------------
+    # Send primitives
+    # ------------------------------------------------------------------
+
+    def _send_direct(self, header: dict, payload: bytes = b"") -> bool:
+        """Synchronous send used ONLY during the join handshake (before the
+        sender thread starts).  All post-handshake code must use _send()."""
+        if self.sock is None:
+            return False
+        return send_frame(self.sock, header, payload)
+
+    def _send(self, header: dict, payload: bytes = b"", priority: int = 0) -> bool:
+        """Non-blocking high-priority send: enqueue to _send_hi_q and return
+        immediately.  The sender thread drains this queue before touching any
+        file chunk.  Returns False only when _quit is already set."""
+        if self._quit:
+            return False
+        try:
+            self._send_hi_q.put_nowait((header, payload))
+            return True
+        except Exception:
+            return False
+
+    def _send_lo(self, header: dict, payload: bytes = b"") -> bool:
+        """Blocking low-priority send for file chunks.  Enqueues to _send_lo_q
+        and waits until the sender thread processes the frame and reports the
+        result.  Returns False on socket failure or quit."""
+        if self._quit:
+            return False
+        import queue as _q
+        ev  = threading.Event()
+        res = [False]
+        self._send_lo_q.put((header, payload, ev, res))
+        ev.wait()   # sender thread always sets the event; no infinite hang
+        return res[0]
+
+    def _flush_send_lo_queue(self) -> None:
+        """Signal every pending lo-priority waiter with failure so file-send
+        threads detect the dead socket and enter the migration pause."""
+        import queue as _q
+        while True:
+            try:
+                _, _, ev, res = self._send_lo_q.get_nowait()
+                res[0] = False
+                ev.set()
+            except _q.Empty:
+                break
+
+    def _sender_loop(self) -> None:
+        """Persistent sender thread.  Runs for the full client lifetime across
+        all bore tunnel migrations.
+
+        Invariant: every item put into _send_lo_q has its Event set before
+        this method returns, so _send_lo() never blocks forever.
+
+        Priority rule: _send_hi_q is drained completely before any single
+        lo-priority frame is sent, and again between each pair of lo-priority
+        frames.  This guarantees chat/control frames are never behind a file
+        chunk from the user's perspective, even on a slow bore tunnel.
+        """
+        import queue as _q
+
+        def _drain_hi() -> bool:
+            """Drain all hi-prio items. Returns False if socket fails."""
+            while True:
+                try:
+                    hdr, pay = self._send_hi_q.get_nowait()
+                except _q.Empty:
+                    return True
+                if self._quit:
+                    return False
+                sock = self.sock
+                if sock is None:
+                    # Migration in progress — silently drop disposable frames
+                    # (heartbeats, users_req…).  Chat messages were already
+                    # short-circuited into _pending_outbox by _send_chat().
+                    continue
+                try:
+                    if not send_frame(sock, hdr, pay):
+                        return False
+                except OSError:
+                    return False
+            # unreachable
+
+        try:
+            while not self._quit:
+                # ── Phase 1: flush all hi-priority ────────────────────────
+                if not _drain_hi():
+                    # Socket died while sending a hi-prio frame.
+                    # Flush lo-queue waiters so file threads detect migration.
+                    self._flush_send_lo_queue()
+                    # Don't exit — wait for the new socket after migration.
+                    # The outer loop will retry once self.sock is set again.
+                    time.sleep(0.05)
+                    continue
+
+                # ── Phase 2: one lo-priority frame ────────────────────────
+                try:
+                    hdr, pay, ev, res = self._send_lo_q.get(timeout=0.005)
+                except _q.Empty:
+                    continue
+
+                if self._quit:
+                    res[0] = False
+                    ev.set()
+                    break
+
+                # Final hi-prio drain before committing to the chunk so a
+                # chat message typed mid-transfer still beats this chunk.
+                if not _drain_hi():
+                    res[0] = False
+                    ev.set()
+                    self._flush_send_lo_queue()
+                    time.sleep(0.05)
+                    continue
+
+                sock = self.sock
+                if sock is None:
+                    res[0] = False
+                    ev.set()
+                    continue
+
+                try:
+                    ok = send_frame(sock, hdr, pay)
+                except OSError:
+                    ok = False
+
+                res[0] = ok
+                ev.set()
+
+                if not ok:
+                    # Socket died mid-chunk — flush remaining lo waiters.
+                    self._flush_send_lo_queue()
+                    time.sleep(0.05)   # brief pause before retrying hi-drain
+        finally:
+            # Guarantee: no _send_lo() call ever hangs after we exit.
+            self._flush_send_lo_queue()
 
     def run(self) -> None:
         """Main entry point: connect, join, and start I/O threads."""
@@ -343,7 +566,15 @@ class NoEyesClient:
         for subfolder in ("images", "videos", "audio", "docs", "other"):
             (RECEIVE_BASE / subfolder).mkdir(parents=True, exist_ok=True)
 
-        backoff = 2
+        # Clean up any .part files left over from a previous session that
+        # was interrupted before transfers completed.
+        for part_file in RECEIVE_BASE.rglob("*.part"):
+            try:
+                part_file.unlink()
+            except Exception:
+                pass
+
+        backoff = 1
         session_start = 0.0
 
         # CRT animation runs once before we open any connection.
@@ -351,34 +582,59 @@ class NoEyesClient:
         utils.play_startup_animation()
 
         while True:
-            # Clear accumulated logs so server history replay doesn't stack
-            # on top of messages from the previous (disconnected) session.
-            utils.reset_for_reconnect()
+            # Always clear logs before history replay on real disconnects.
+            # During migration, keep logs and seen-set intact — already_seen
+            # dedup silently skips replayed messages so screen never flashes.
+            utils.reset_for_reconnect(is_migration=self._migrating)
 
             if not self.connect():
                 if not self.reconnect or self._quit:
-                    return
-                utils.print_msg(utils.cwarn(f"[reconnect] Retrying in {backoff}s…"))
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 60)
+                    if not self._migrating:
+                        return
+                if self._migrating:
+                    # Tunnel not yet ready — update panel spinner, no log spam.
+                    utils.set_panel_status(f"↻ :{self.port} retrying…")
+                else:
+                    utils.print_msg(utils.cwarn(f"[reconnect] Retrying in {backoff}s…"))
+                # Discovery: check if the server's bore port has changed.
+                if (self._using_bore and not self._no_discovery
+                        and self._discovery_key):
+                    _new_port = self._discovery_lookup()
+                    if _new_port and _new_port != self.port:
+                        self.port = _new_port
+                        utils.set_panel_status(f"↻ :{_new_port}")
+                # During migration hammer the reconnect — no exponential backoff.
+                # For non-migration drops keep the backoff to avoid tight loops.
+                if self._migrating:
+                    time.sleep(0.15)
+                else:
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 10)
                 continue
 
             session_start = time.monotonic()
-            backoff = 2
+            # Don't reset backoff here — only reset it after a successful join.
+            # If we reset on every TCP connect, nick_error retries always
+            # sleep 1s regardless of how many times we've retried.
 
-            # Send join event
+            # Send join event — include our Ed25519 verify key so the server
+            # can issue a challenge if our username is still registered (e.g.
+            # an in-progress bore tunnel migration where the old session hasn't
+            # timed out yet).  Without vk_hex the server falls through to the
+            # "username taken" branch → nick_error → 3-second wait per retry.
             join_header = {
-                "type":     "system",
-                "event":    "join",
-                "username": self.username,
-                "room":     self.room,
+                "type":         "system",
+                "event":        "join",
+                "username":     self.username,
+                "room":         self._room_token(),
+                "vk_hex":       self.vk_hex,
+                "inbox_token":  self.inbox_token,
             }
-            if not self._send(join_header):
-                # Send failed immediately — avoid tight loop
+            if not self._send_direct(join_header):
                 if not self.reconnect or self._quit:
                     return
                 time.sleep(backoff)
-                backoff = min(backoff * 2, 60)
+                backoff = min(backoff * 2, 10)
                 continue
 
             # ----------------------------------------------------------------
@@ -400,7 +656,7 @@ class NoEyesClient:
                 if not self.reconnect or self._quit:
                     return
                 time.sleep(backoff)
-                backoff = min(backoff * 2, 60)
+                backoff = min(backoff * 2, 10)
                 continue
 
             _hs_hdr, _ = _hs_result
@@ -411,7 +667,7 @@ class NoEyesClient:
                 # claimed vk_hex.  Sign the nonce and send the response.
                 _nonce = str(_hs_hdr.get("nonce", ""))
                 _sig   = enc.sign_message(self.sk_bytes, _nonce.encode()).hex()
-                if not self._send({
+                if not self._send_direct({
                     "type":  "system",
                     "event": "auth_response",
                     "sig":   _sig,
@@ -419,7 +675,7 @@ class NoEyesClient:
                     if not self.reconnect or self._quit:
                         return
                     time.sleep(backoff)
-                    backoff = min(backoff * 2, 60)
+                    backoff = min(backoff * 2, 10)
                     continue
                 # Read the server's final verdict after verifying our signature
                 self.sock.settimeout(10.0)
@@ -433,19 +689,25 @@ class NoEyesClient:
                     if not self.reconnect or self._quit:
                         return
                     time.sleep(backoff)
-                    backoff = min(backoff * 2, 60)
+                    backoff = min(backoff * 2, 10)
                     continue
                 _hs_hdr, _ = _hs_result
                 _hs_event   = _hs_hdr.get("event", "")
 
-            if _hs_event == "nick_error":
-                utils.print_msg(utils.cerr(
-                    f"[error] {_hs_hdr.get('message', 'Connection rejected by server.')}"
-                ))
-                if not self.reconnect or self._quit:
-                    return
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 60)
+            if _hs_event in ("nick_error", "auth_failed"):
+                # During migration the server may still hold the old session
+                # for a few seconds after bore kills the tunnel.  Suppress the
+                # error print and wait quietly — it will clear on its own.
+                if self._migrating:
+                    time.sleep(3)
+                else:
+                    utils.print_msg(utils.cerr(
+                        f"[error] {_hs_hdr.get('message', 'Connection rejected by server.')}"
+                    ))
+                    if not self.reconnect or self._quit:
+                        return
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 10)
                 continue
 
             if _hs_event != "auth_ok":
@@ -455,30 +717,85 @@ class NoEyesClient:
                 if not self.reconnect or self._quit:
                     return
                 time.sleep(backoff)
-                backoff = min(backoff * 2, 60)
+                backoff = min(backoff * 2, 10)
                 continue
             # auth_ok received — handshake complete, history replay follows
+            backoff = 1  # reset only here, after a confirmed successful join
+
+            # If the server included its current bore port in auth_ok (crash
+            # recovery path: migrate broadcast reached nobody because all clients
+            # were already dropped when bore.pub killed the tunnel), update
+            # self.port now so the NEXT reconnect cycle uses the correct port.
+            # Only act if the port actually changed — avoids a no-op migrate loop.
+            _auth_bore_port = _hs_hdr.get("bore_port")
+            if _auth_bore_port and int(_auth_bore_port) != self.port:
+                utils.print_ephemeral(utils.cgrey(
+                    f"[migrate] bore port updated → {_auth_bore_port}"
+                ))
+                self.port = int(_auth_bore_port)
+            if _auth_bore_port:
+                self._using_bore = True
+
+            # Migration complete — clear the flag before history replay so
+            # the next unplanned disconnect gets a fresh reset as normal.
+            was_migrating  = self._migrating
+            self._migrating = False
+
+            # Clear tunnel-down state regardless of whether this was a clean
+            # migration or an unexpected drop — we are back online either way.
+            if self._using_bore and utils.is_tunnel_down():
+                utils.set_tunnel_down(False)
+                utils.clear_ephemeral_lines()
 
             # Announce our Ed25519 pubkey
             self._announce_pubkey()
 
-            utils.switch_room_display(self.room)
+            if was_migrating:
+                # Screen is already showing the right room — don't re-enter
+                # or re-clear it.  Just clear the spinner and ephemeral notices
+                # in a single redraw so the user never sees a flash or blank.
+                utils.set_panel_status("")
+                utils.clear_ephemeral_lines()
+            else:
+                utils.switch_room_display(self.room)
+                enter_tui()
 
-            # Enter TUI mode after connecting and before starting the input loop
-            enter_tui()
+            # Signal file-send threads and unblock send path.
+            self._reconnect_event.set()
+
+            # Flush any messages typed during the tunnel-down / migration window.
+            if self._pending_outbox:
+                pending = self._pending_outbox[:]
+                self._pending_outbox.clear()
+                for _item in pending:
+                    if len(_item) == 3:
+                        _text, _tag, _ts = _item
+                    else:
+                        _text, _tag = _item
+                        _ts = ""
+                    self._send_chat(_text, tag=_tag, _ts=_ts)
+
+            # Flush buffered privmsgs per peer.
+            if self._pending_privmsg:
+                pending_pm = self._pending_privmsg.copy()
+                self._pending_privmsg.clear()
+                for _peer, _msgs in pending_pm.items():
+                    for _text, _tag, _ts in _msgs:
+                        self._send_privmsg_encrypted(_peer, _text, _tag)
 
             # Register Tab key room-switch callback so utils.py can notify the server
             import core.encryption as _enc_mod
             def _tab_cb(room: str) -> None:
                 self._room_fernet = _enc_mod.derive_room_fernet(self._master_key_bytes, room)
                 self.room = room
-                self._send({"type": "command", "event": "join_room", "room": room})
+                self._send({"type": "command", "event": "join_room", "room": self._room_token()})
+                self._announce_pubkey()
             utils._tab_switch_cb = _tab_cb
 
             # Register panel click callback
             def _panel_cb(action: str, name: str) -> None:
                 if action == "join":
-                    self._process_input(f"/join {name}")
+                    self._process_input(f"/join {action}")
                 elif action == "msg":
                     utils._panel_prefill(f"/msg {name} ")
             utils.set_panel_action_cb(_panel_cb)
@@ -489,10 +806,23 @@ class NoEyesClient:
             try:
                 self._running = True
 
-                self._recv_thread  = threading.Thread(target=self._recv_loop,  daemon=True)
-                self._input_thread = threading.Thread(target=self._input_loop, daemon=True)
+                # Start the dedicated sender thread.  It runs for the entire
+                # client lifetime (across bore migrations) so we only create it
+                # once — check is_alive() to avoid spawning a second thread on
+                # reconnect while the old one is still winding down.
+                if not hasattr(self, "_sender_thread") or \
+                        not self._sender_thread.is_alive():
+                    self._sender_thread = threading.Thread(
+                        target=self._sender_loop, daemon=True, name="noeyes-sender"
+                    )
+                    self._sender_thread.start()
+
+                self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
                 self._recv_thread.start()
-                self._input_thread.start()
+
+                if self._input_thread is None or not self._input_thread.is_alive():
+                    self._input_thread = threading.Thread(target=self._input_loop, daemon=True)
+                    self._input_thread.start()
 
                 try:
                     self._recv_thread.join()
@@ -507,38 +837,94 @@ class NoEyesClient:
                         self.sock.close()
                     except OSError:
                         pass
+                    self._reconnect_event.set()  # unblock any waiting file threads
                     utils.print_msg(utils.cinfo("\n[bye] Disconnected."))
                     return
 
                 # If the session lasted less than 5 seconds it was a bad connection,
                 # not a normal drop — apply backoff so we don't spin tight on localhost.
                 session_duration = time.monotonic() - session_start
-                if session_duration < 5.0:
-                    backoff = min(backoff * 2, 60)
+                if session_duration < 5.0 and not self._migrating:
+                    backoff = min(backoff * 2, 10)
 
-                utils.print_msg(utils.cwarn(f"[reconnect] Connection lost. Reconnecting in {backoff}s…"))
+                if not self._migrating:
+                    if self._using_bore:
+                        self._migrating = True
+                        self._migration_quiet_until = time.monotonic() + 30
+                        self._reconnect_event.clear()
+                        utils.print_ephemeral(utils.cgrey("↻  Reconnecting…"))
+                        # Update prompt colour without printing the tunnel-down message
+                        utils._tunnel_down[0] = True
+                        utils._PROMPT     = utils._PROMPT_DOWN
+                        utils._PROMPT_VIS = 2
+                        if utils._tui_active:
+                            with utils._OUTPUT_LOCK:
+                                utils._redraw_input_unsafe()
+                    else:
+                        utils.print_msg(utils.cwarn(
+                            f"[reconnect] Connection lost. Reconnecting in {backoff}s…"
+                        ))
                 try:
                     self.sock.close()
                 except OSError:
                     pass
-                time.sleep(backoff)
+                if not self._migrating:
+                    time.sleep(backoff)
             finally:
-                # Exit TUI mode on disconnect / quit
-                exit_tui()
+                # Only exit TUI on a real quit or unrecoverable disconnect —
+                # never during a migration/bore reconnect so the screen stays alive.
+                if self._quit or not self._migrating:
+                    exit_tui()
 
     # ------------------------------------------------------------------
     # Announce / pubkey
     # ------------------------------------------------------------------
 
+    def _discovery_lookup(self) -> int:
+        """
+        Poll the discovery service for the current bore port.
+        Uses keyvalue.immanuel.co — reads the app-key cached at
+        ~/.noeyes/discovery_appkey.  Returns the port as int, or 0 on failure.
+        """
+        import urllib.request as _ur
+        from pathlib import Path as _P
+        import re as _re
+        try:
+            appkey_file = _P.home() / ".noeyes" / "discovery_appkey"
+            if not appkey_file.exists():
+                return 0
+            ak = appkey_file.read_text().strip()
+            if not ak or not _re.match(r'^[A-Za-z0-9]{6,}', ak):
+                return 0
+            url = f"https://keyvalue.immanuel.co/api/KeyVal/GetValue/{ak}/{self._discovery_key}"
+            with _ur.urlopen(url, timeout=8) as r:
+                val = r.read().decode().strip().strip('"')
+                return int(val) if val and val.isdigit() else 0
+        except Exception:
+            return 0
+
+    def _room_token(self) -> str:
+        """
+        Compute the opaque room routing token.
+        blake2s((room_name + group_key_hex).encode(), digest_size=16)
+        Server never sees the human-readable room name — only this token.
+        Stable per (room, group_key) pair so all clients independently arrive
+        at the same token without coordination.
+        """
+        import hashlib as _hl
+        raw = (self.room + self._master_key_bytes.hex()).encode()
+        return _hl.blake2s(raw, digest_size=16).hexdigest()
+
     def _announce_pubkey(self) -> None:
-        """Tell the server (and via server, room peers) our Ed25519 verify key."""
+        """Tell room peers our Ed25519 verify key and inbox_token."""
         header = {
-            "type":     "pubkey_announce",
-            "username": self.username,
-            "vk_hex":   self.vk_hex,
-            "room":     self.room,
+            "type":        "pubkey_announce",
+            "username":    self.username,
+            "vk_hex":      self.vk_hex,
+            "inbox_token": self.inbox_token,   # so peers can compute our token locally
+            "room":        self._room_token(),
         }
-        self._send( header)
+        self._send(header)
 
     # ------------------------------------------------------------------
     # Receive loop
@@ -561,6 +947,53 @@ class NoEyesClient:
 
         if msg_type == "heartbeat":
             self._send({"type": "heartbeat"})
+            return
+
+        # Bore tunnel migration — server is rolling over to a new port.
+        # Update self.port and close the socket; the existing reconnect loop
+        # picks it up immediately with the new port. No other logic needed.
+        if msg_type == "system" and header.get("event") == "migrate":
+            new_port = header.get("port")
+            if new_port:
+                # CVE-NE-006 FIX: if the server included a signature over
+                # f"{port}:{ts}", verify it against the pinned server vk before
+                # acting on the migrate event.  A missing sig is allowed when TLS
+                # is active (TLS already prevents injection); in --no-tls mode a
+                # missing sig is warned but accepted for backward-compat.
+                _migrate_sig = header.get("migrate_sig", "")
+                _server_vk   = getattr(self, "_server_vk_hex", "")
+                if _migrate_sig and _server_vk:
+                    _migrate_msg = f"{new_port}:{header.get('ts', '')}".encode()
+                    try:
+                        _sig_ok = enc.verify_signature(
+                            bytes.fromhex(_server_vk),
+                            _migrate_msg,
+                            bytes.fromhex(_migrate_sig),
+                        )
+                    except Exception:
+                        _sig_ok = False
+                    if not _sig_ok:
+                        utils.print_msg(utils.cerr(
+                            "[security] migrate event has INVALID signature — ignoring. "
+                            "Possible evil-twin redirection attempt."
+                        ))
+                        return
+                elif not self._tls and not _migrate_sig:
+                    utils.print_msg(utils.cwarn(
+                        "[security] migrate event has no signature (--no-tls mode). "
+                        "Accepting, but upgrade to TLS for full protection."
+                    ))
+                self.port = int(new_port)
+                self._migrating = True
+                self._migration_quiet_until = time.monotonic() + 15
+                self._reconnect_event.clear()
+                utils.print_ephemeral(utils.cgrey("↻  Reconnecting…"))
+                utils.set_panel_status(f"↻ :{new_port}")
+                self._running = False
+                try:
+                    self.sock.close()
+                except OSError:
+                    pass
             return
 
         # Fast path: binary file chunk (no JSON parsing of payload)
@@ -627,12 +1060,54 @@ class NoEyesClient:
                     f"  If you trust them, type:  /trust {uname}"
                 ))
 
+        # Refresh sidebar now that we can resolve this token to a username
+        self._send({"type": "command", "event": "users_req", "room": self.room})
+
     # ------------------------------------------------------------------
     # DH handshake
     # ------------------------------------------------------------------
 
     _DH_TIMEOUT = 30.0   # seconds before a stale pending handshake is retried
 
+    def _peer_inbox_token(self, peer_username: str) -> str:
+        """
+        Derive the inbox routing token for *peer_username* from their TOFU vk.
+        Returns empty string if peer vk is unknown (server will silently drop).
+        Formula: blake2s(vk_bytes, digest_size=16).hexdigest() — same as server.
+        """
+        import hashlib as _hl
+        peer_vk = self.tofu_store.get(peer_username, "")
+        if not peer_vk:
+            return ""
+        try:
+            return _hl.blake2s(bytes.fromhex(peer_vk), digest_size=16).hexdigest()
+        except Exception:
+            return ""
+
+    def _token_to_username(self, token: str) -> str:
+        """
+        Reverse-lookup: find the username whose TOFU vk maps to *token*.
+        Scans tofu_store first (trusted keys), then _tofu_pending (mismatched
+        keys) so users with key mismatches still show their name, not a hex stub.
+        Returns empty string if not found (unknown peer, TOFU not yet set).
+        """
+        import hashlib as _hl
+        for uname, vk_hex in self.tofu_store.items():
+            try:
+                t = _hl.blake2s(bytes.fromhex(vk_hex), digest_size=16).hexdigest()
+                if t == token:
+                    return uname
+            except Exception:
+                continue
+        # Also check pending/mismatched keys — identity changed but name is known.
+        for uname, vk_hex in self._tofu_pending.items():
+            try:
+                t = _hl.blake2s(bytes.fromhex(vk_hex), digest_size=16).hexdigest()
+                if t == token:
+                    return uname
+            except Exception:
+                continue
+        return ""
     def _ensure_dh(self, peer: str, then_send: Optional[tuple] = None) -> None:
         """
         Ensure a pairwise Fernet with *peer* is established.
@@ -668,21 +1143,35 @@ class NoEyesClient:
             "ts":   time.monotonic(),   # used to detect stale handshakes
         }
 
+        # CVE-NE-001 FIX: sign the DH public key with our Ed25519 signing key
+        # before encrypting.  Without this, any group member who has chat.key
+        # can silently MITM the handshake by swapping in their own DH pubkey.
+        dh_pub_bytes = pub_bytes  # raw 32-byte X25519 public key
+        dh_sig = enc.sign_message(self.sk_bytes, dh_pub_bytes).hex()
+
         # Encrypt the DH public key with the group key so the server cannot read it.
-        inner = json.dumps({"dh_pub": pub_bytes.hex()}).encode()
+        inner = json.dumps({"dh_pub": pub_bytes.hex(), "sig": dh_sig}).encode()
         encrypted_payload = self.group_fernet.encrypt(inner)
 
+        # Zero-metadata routing: address by opaque inbox token, not username.
+        # Include our own token so the recipient can route the dh_resp back.
+        peer_token = self._peer_inbox_token(peer)
         header = {
-            "type": "dh_init",
-            "to":   peer,
-            "from": self.username,
+            "type":       "dh_init",
+            "to":         peer_token,
+            "from_token": self.inbox_token,   # recipient needs this to send dh_resp
+            "from":       self.username,       # still needed so recipient knows who initiated
         }
         self._send(header, encrypted_payload)
         utils.print_msg(utils.cgrey(f"[dh] Initiating key exchange with {peer}…"))
 
     def _handle_dh_init(self, header: dict, payload: bytes) -> None:
         """Respond to a dh_init from *from_user* with our DH public key."""
+        # `from` is stripped by the server (zero-metadata routing).
+        # Resolve the sender via from_token → TOFU reverse lookup.
         from_user = header.get("from", "").lower()
+        if not from_user:
+            from_user = self._token_to_username(header.get("from_token", ""))
         if not from_user or from_user == self.username:
             return
 
@@ -693,6 +1182,31 @@ class NoEyesClient:
             peer_dh_pub = bytes.fromhex(inner["dh_pub"])
         except (InvalidToken, KeyError, ValueError):
             utils.print_msg(utils.cwarn(f"[dh] Could not decrypt dh_init from {from_user}"))
+            return
+
+        # CVE-NE-001 FIX: verify the Ed25519 signature over the DH pubkey.
+        # Reject the handshake if the signature is missing or invalid so a
+        # group-member MITM cannot silently swap in their own DH pubkey.
+        sig_hex = inner.get("sig", "")
+        peer_vk_hex = self.tofu_store.get(from_user, "")
+        if not sig_hex or not peer_vk_hex:
+            utils.print_msg(utils.cwarn(
+                f"[dh] REJECTED dh_init from {from_user}: "
+                f"{'no signature' if not sig_hex else 'unknown identity key — run /users first'}."
+            ))
+            return
+        try:
+            sig_valid = enc.verify_signature(
+                bytes.fromhex(peer_vk_hex),
+                bytes.fromhex(inner["dh_pub"]),
+                bytes.fromhex(sig_hex),
+            )
+        except Exception:
+            sig_valid = False
+        if not sig_valid:
+            utils.print_msg(utils.cwarn(
+                f"[dh] REJECTED dh_init from {from_user}: invalid Ed25519 signature — possible MITM."
+            ))
             return
 
         # Bug fix: simultaneous DH initiation tiebreaker.
@@ -723,13 +1237,16 @@ class NoEyesClient:
         utils.print_msg(utils.cok(f"[dh] Pairwise key established with {from_user}."))
 
         # Send dh_resp
-        resp_inner = json.dumps({"dh_pub": pub_bytes.hex()}).encode()
+        # CVE-NE-001 FIX: sign our DH pubkey so the initiator can verify it.
+        resp_sig = enc.sign_message(self.sk_bytes, pub_bytes).hex()
+        resp_inner = json.dumps({"dh_pub": pub_bytes.hex(), "sig": resp_sig}).encode()
         resp_payload = self.group_fernet.encrypt(resp_inner)
 
         header_resp = {
-            "type": "dh_resp",
-            "to":   from_user,
-            "from": self.username,
+            "type":       "dh_resp",
+            "to":         header.get("from_token", self._peer_inbox_token(from_user)),
+            "from_token": self.inbox_token,
+            "from":       self.username,   # recipient needs to know who responded
         }
         self._send(header_resp, resp_payload)
 
@@ -739,9 +1256,10 @@ class NoEyesClient:
         for text, tag in self._msg_queue.pop(from_user, []):
             self._send_privmsg_encrypted(from_user, text, tag=tag)
 
-        # Flush queued file sends
+        # Flush queued file sends — run each in its own thread so large transfers
+        # never block the recv loop that called this handler.
         for filepath in self._file_queue.pop(from_user, []):
-            self._send_file(from_user, filepath)
+            threading.Thread(target=self._send_file, args=(from_user, filepath), daemon=True).start()
 
         # Replay any incoming privmsgs that arrived before the key was ready
         self._flush_privmsg_buffer(from_user)
@@ -749,6 +1267,8 @@ class NoEyesClient:
     def _handle_dh_resp(self, header: dict, payload: bytes) -> None:
         """Complete the DH exchange after receiving a dh_resp."""
         from_user = header.get("from", "").lower()
+        if not from_user:
+            from_user = self._token_to_username(header.get("from_token", ""))
         if from_user not in self._dh_pending:
             return
 
@@ -758,6 +1278,31 @@ class NoEyesClient:
             peer_dh_pub = bytes.fromhex(inner["dh_pub"])
         except (InvalidToken, KeyError, ValueError):
             utils.print_msg(utils.cwarn(f"[dh] Could not decrypt dh_resp from {from_user}"))
+            return
+
+        # CVE-NE-001 FIX: verify Ed25519 signature over the responder's DH pubkey.
+        resp_sig_hex  = inner.get("sig", "")
+        resp_vk_hex   = self.tofu_store.get(from_user, "")
+        if not resp_sig_hex or not resp_vk_hex:
+            utils.print_msg(utils.cwarn(
+                f"[dh] REJECTED dh_resp from {from_user}: "
+                f"{'no signature' if not resp_sig_hex else 'unknown identity key'}."
+            ))
+            self._dh_pending.pop(from_user, None)
+            return
+        try:
+            resp_sig_valid = enc.verify_signature(
+                bytes.fromhex(resp_vk_hex),
+                bytes.fromhex(inner["dh_pub"]),
+                bytes.fromhex(resp_sig_hex),
+            )
+        except Exception:
+            resp_sig_valid = False
+        if not resp_sig_valid:
+            utils.print_msg(utils.cwarn(
+                f"[dh] REJECTED dh_resp from {from_user}: invalid Ed25519 signature — possible MITM."
+            ))
+            self._dh_pending.pop(from_user, None)
             return
 
         priv_bytes = self._dh_pending.pop(from_user)["priv"]
@@ -770,9 +1315,10 @@ class NoEyesClient:
         for text, tag in self._msg_queue.pop(from_user, []):
             self._send_privmsg_encrypted(from_user, text, tag=tag)
 
-        # Flush queued file sends
+        # Flush queued file sends — run each in its own thread so large transfers
+        # never block the recv loop that called this handler.
         for filepath in self._file_queue.pop(from_user, []):
-            self._send_file(from_user, filepath)
+            threading.Thread(target=self._send_file, args=(from_user, filepath), daemon=True).start()
 
         # Replay any incoming privmsgs that arrived before the key was ready
         self._flush_privmsg_buffer(from_user)
@@ -781,9 +1327,10 @@ class NoEyesClient:
     # Sending messages
     # ------------------------------------------------------------------
 
-    def _send_chat(self, text: str, tag: str = "") -> None:
+    def _send_chat(self, text: str, tag: str = "", _ts: str = "") -> None:
         """Encrypt and broadcast a group chat message."""
-        ts  = time.strftime("%H:%M:%S")   # single capture — used in body AND mark_seen
+        # Reuse a preserved timestamp (from pending_outbox flush) or capture now.
+        ts  = _ts or time.strftime("%H:%M:%S")
         sig = enc.sign_message(self.sk_bytes, text.encode("utf-8")).hex()
         body_dict: dict = {
             "text":     text,
@@ -803,17 +1350,37 @@ class NoEyesClient:
             # Server rejects any frame whose mid it has already seen for this room.
             "mid":  os.urandom(16).hex(),
         }
-        self._send(header, payload)
-        utils.log_and_print(self.room, utils.format_message(self.username, text, ts, is_own=True))
-        utils.mark_seen(self.room, self.username, ts, text)
+        # If tunnel is down or migration in progress — buffer the message.
+        # Show it locally immediately so the user knows it was captured,
+        # and show a one-line "buffered" notice that disappears on reconnect.
+        if (self._using_bore and utils.is_tunnel_down()) or not self._reconnect_event.is_set():
+            self._pending_outbox.append((text, tag, ts))
+            if not utils.already_seen(self.room, self.username, ts, text):
+                utils.log_and_print(self.room, utils.format_message(self.username, text, ts, is_own=True))
+                utils.mark_seen(self.room, self.username, ts, text)
 
-    def _send_privmsg_encrypted(self, peer: str, text: str, tag: str = "") -> None:
-        """Send a /msg to *peer* using the established pairwise Fernet."""
+            return
+        self._send(header, payload)
+        # Guard against double-display on flush path (message was already logged
+        # when it was queued during the migration window above).
+        if not utils.already_seen(self.room, self.username, ts, text):
+            utils.log_and_print(self.room, utils.format_message(self.username, text, ts, is_own=True))
+            utils.mark_seen(self.room, self.username, ts, text)
+
+    def _send_privmsg_encrypted(self, peer: str, text: str, tag: str = "") -> bool:
+        """Send a /msg to *peer* using the established pairwise Fernet.
+        Returns True if the frame was handed to the socket, False on failure."""
+        if self._using_bore and utils.is_tunnel_down():
+            ts = time.strftime("%H:%M:%S")
+            self._pending_privmsg.setdefault(peer, []).append((text, tag, ts))
+            utils.log_and_print(self.room, utils.format_privmsg(f"you → {peer}", text, ts, verified=True))
+
+            return False
         pairwise = self._pairwise.get(peer)
         if pairwise is None:
             utils.print_msg(utils.cwarn(f"[msg] No pairwise key for {peer} — queuing after DH."))
             self._ensure_dh(peer, then_send=(text, tag))
-            return
+            return False
 
         ts  = time.strftime("%H:%M:%S")
         sig = enc.sign_message(self.sk_bytes,
@@ -830,27 +1397,35 @@ class NoEyesClient:
         payload = pairwise.encrypt(body)
 
         header = {
-            "type": "privmsg",
-            "to":   peer,
-            "from": self.username,
+            "type":       "privmsg",
+            "to":         self._peer_inbox_token(peer),  # opaque token, not username
+            "from_token": self.inbox_token,               # so recipient can reply
             # Replay-protection ID — same mechanism as group chat.
-            "mid":  os.urandom(16).hex(),
+            "mid":        os.urandom(16).hex(),
         }
-        self._send( header, payload)
-        utils.log_and_print(self.room, utils.format_privmsg(f"you → {peer}", text, ts, verified=True))
+        # Note: `from` is intentionally omitted from the header.
+        # The recipient authenticates sender identity from the encrypted payload
+        # (username + Ed25519 sig inside pairwise Fernet), not from the plaintext header.
+        ok = self._send(header, payload)
+        # Only log to chat for real text messages, not internal file-transfer
+        # control frames (file_start / file_end) whose text is a raw JSON blob.
+        # BUG-001 FIX: file_resume_ack was added by the bore resume patch but
+        # was not added here, causing raw JSON ack blobs to appear in the chat window.
+        if ok and tag not in ("file_start", "file_end", "file_resume_ack"):
+            utils.log_and_print(self.room, utils.format_privmsg(f"you → {peer}", text, ts, verified=True))
+        return ok
 
     def _handle_chat(self, header: dict, payload: bytes, ts: str) -> None:
         """Decrypt and display a group chat message."""
-        from_user = header.get("from", "?").lower()
         try:
             body = json.loads(self._room_fernet.decrypt(payload))
             text   = body.get("text", "")
             msg_ts = body.get("ts", ts)
+            # Sender identity lives inside the encrypted payload (sealed sender).
+            # The server strips `from` from the header — read from body instead.
+            from_user = body.get("username", header.get("from", "?")).lower()
         except (InvalidToken, json.JSONDecodeError):
-            utils.print_msg(utils.cwarn(
-                f"[warn] Could not decrypt group message from {from_user}. "
-                "Wrong key?"
-            ))
+            utils.print_msg(utils.cwarn("[warn] Could not decrypt group message. Wrong key?"))
             return
 
         # Verify Ed25519 signature if we have a trusted key for this sender.
@@ -895,7 +1470,11 @@ class NoEyesClient:
 
     def _handle_privmsg(self, header: dict, payload: bytes, ts: str) -> None:
         """Decrypt and dispatch a private message frame."""
-        from_user = header.get("from", "?").lower()
+        from_user = header.get("from", "").lower()
+        if not from_user:
+            from_user = self._token_to_username(header.get("from_token", ""))
+        if not from_user:
+            from_user = "?"
 
         pairwise = self._pairwise.get(from_user)
         if pairwise is None:
@@ -917,7 +1496,7 @@ class NoEyesClient:
         # We check body first so file transfers never leak type to the server.
         subtype = header.get("subtype") or body.get("tag", "text")
 
-        if subtype in ("file_start", "file_chunk", "file_end"):
+        if subtype in ("file_start", "file_chunk", "file_end", "file_resume_ack"):
             # Sender wraps metadata as json.dumps(meta_dict) in body["text"].
             # Unwrap it so handlers can access fields directly.
             inner = body.get("text", "")
@@ -935,6 +1514,8 @@ class NoEyesClient:
                 self._handle_file_chunk(from_user, file_body)
             elif subtype == "file_end":
                 self._handle_file_end(from_user, file_body, ts)
+            elif subtype == "file_resume_ack":
+                self._handle_file_resume_ack(from_user, file_body)
         else:
             # Plain text message
             text    = body.get("text", "")
@@ -983,12 +1564,48 @@ class NoEyesClient:
         # Cap total_chunks — an uncapped value lets a malicious sender set
         # total_chunks=9999999 so the transfer never completes, leaking the
         # temp file handle and _incoming_files entry forever.
-        # 100_000 chunks × 32 MB = ~3 TB effective max — no practical limit
+        # 100_000 chunks × 4 MB = ~400 GB effective max — no practical limit
         # while still blocking the DoS attack.  Security is unaffected: each
         # chunk is independently AES-256-GCM authenticated regardless of count.
         _MAX_CHUNKS = 100_000
         total    = min(int(body.get("total_chunks", 1)), _MAX_CHUNKS)
         size     = body.get("total_size", 0)
+
+        # ── Idempotency guard / Resume ────────────────────────────────────────
+        # The sender retransmits file_start with the same tid after a bore
+        # migration.  Reply with a resume ack so the sender can skip ahead to
+        # our current next_index instead of restarting from chunk 0.
+        if tid in self._incoming_files:
+            meta = self._incoming_files[tid]
+            ack_body = {
+                "transfer_id": tid,
+                "next_index":  meta["next_index"],
+            }
+            self._send_privmsg_encrypted(
+                from_user, json.dumps(ack_body), tag="file_resume_ack"
+            )
+            return
+
+        # ── Orphan cleanup ────────────────────────────────────────────────────
+        # If this sender already has an in-progress transfer with a different tid,
+        # it was interrupted mid-migration and restarted from scratch with a new
+        # tid.  Close and delete the stale temp file immediately so .part files
+        # don't accumulate on disk.
+        stale = [t for t, m in self._incoming_files.items()
+                 if m.get("from") == from_user and t != tid]
+        for stale_tid in stale:
+            meta = self._incoming_files.pop(stale_tid)
+            try:
+                meta["tmp_file"].close()
+            except Exception:
+                pass
+            try:
+                os.unlink(meta["tmp_path"])
+            except Exception:
+                pass
+            utils.print_msg(utils.cgrey(
+                f"[recv] Cleaned up interrupted transfer from {from_user}."
+            ))
 
         # Open a temp file on disk — chunks written directly, no RAM buffer
         import tempfile as _tf
@@ -1029,21 +1646,33 @@ class NoEyesClient:
 
         if tid not in self._incoming_files:
             return
-        meta = self._incoming_files[tid]
+        meta      = self._incoming_files[tid]
+        from_user = header.get("from", "")
+        if not from_user:
+            from_user = self._token_to_username(header.get("from_token", ""))
+        if not from_user:
+            from_user = meta.get("from", "?")
 
-        from_user = header.get("from", "?")
-        pairwise  = self._pairwise.get(from_user)
-        if pairwise is None:
-            return
-        # Cache derived GCM key per transfer
+        # Resolve the GCM decryption key for this transfer.
+        # Priority:
+        #   1. Already cached in meta["gcm_key"] — use it directly.
+        #      This is the normal post-migration path: the pairwise Fernet entry
+        #      may have been cleaned up by a leave event that fired after the
+        #      15-second quiet window expired, but the derived GCM key is still
+        #      safely stored in the transfer metadata.
+        #   2. Not yet cached — derive it from the live pairwise raw bytes.
+        #      Requires pairwise to be present (first chunk of a new transfer).
         gcm_key = meta.get("gcm_key")
         if gcm_key is None:
             raw = self._pairwise_raw.get(from_user)
             if raw is None:
-                utils.print_msg(utils.cwarn(f"[recv] No raw key for {from_user} — dropping chunk"))
+                utils.print_msg(utils.cwarn(
+                    f"[recv] No pairwise key for {from_user} yet — dropping chunk {index}"
+                ))
                 return
             gcm_key = enc.derive_file_cipher_key(raw, tid)
             meta["gcm_key"] = gcm_key
+
         try:
             raw = enc.gcm_decrypt(gcm_key, gcm_blob)
         except Exception:
@@ -1052,6 +1681,28 @@ class NoEyesClient:
 
         # Drop chunks with index beyond total — prevents unbounded pending dict growth
         if index >= meta["total_chunks"]:
+            return
+
+        # Sender restart detection: if we receive chunk 0 but we've already
+        # written chunks, the sender restarted from the beginning (TCP buffer
+        # loss after migration).  Truncate and reset so we accept the fresh stream.
+        if index == 0 and meta["next_index"] > 0:
+            meta["tmp_file"].seek(0)
+            meta["tmp_file"].truncate(0)
+            meta["hasher"]     = __import__("hashlib").sha256()
+            meta["received"]   = 0
+            meta["next_index"] = 0
+            meta["pending"]    = {}
+            meta.pop("_last_pct", None)
+            old_prog = meta.pop("_prog_line", None)
+            if old_prog:
+                with utils._OUTPUT_LOCK:
+                    room = utils._current_room[0]
+                    try: utils._room_logs[room].remove(old_prog)
+                    except ValueError: pass
+
+        # Drop chunks already written
+        if index < meta["next_index"]:
             return
         meta["pending"][index] = raw
         while meta["next_index"] in meta["pending"]:
@@ -1062,7 +1713,21 @@ class NoEyesClient:
             meta["next_index"] += 1
         if meta["total_chunks"] > 1:
             pct = int(meta["received"] / meta["total_chunks"] * 100)
-            utils.print_msg(utils.cgrey(f"[recv] {pct}%..."))
+            last = meta.get("_last_pct", -1)
+            if pct != last:
+                meta["_last_pct"] = pct
+                old_line = meta.get("_prog_line")
+                new_line = utils.cgrey(f"[recv] {meta['filename']} {pct}%")
+                meta["_prog_line"] = new_line
+                with utils._OUTPUT_LOCK:
+                    room = utils._current_room[0]
+                    # Remove old progress line from log, add new one.
+                    # NOT stored in _ephemeral_lines — file progress must
+                    # survive clear_ephemeral_lines() during migration.
+                    if old_line and old_line in utils._room_logs[room]:
+                        utils._room_logs[room].remove(old_line)
+                    utils._room_logs[room].append(new_line)
+                utils.print_msg(new_line, _skip_log=True)
 
     def _handle_file_chunk(self, from_user: str, body: dict) -> None:
         # Legacy JSON/base64 path (kept for compatibility)
@@ -1096,6 +1761,16 @@ class NoEyesClient:
         meta = self._incoming_files.pop(tid)
         meta["tmp_file"].flush()
         meta["tmp_file"].close()
+
+        # Remove the progress line from the log before printing the result
+        prog_line = meta.get("_prog_line")
+        if prog_line:
+            with utils._OUTPUT_LOCK:
+                room = utils._current_room[0]
+                try:
+                    utils._room_logs[room].remove(prog_line)
+                except ValueError:
+                    pass
 
         if meta["received"] != meta["total_chunks"]:
             utils.print_msg(utils.cwarn(
@@ -1133,26 +1808,44 @@ class NoEyesClient:
             f"{' ✓ verified' if verified else ''}"
         ))
 
+    def _handle_file_resume_ack(self, from_user: str, body: dict) -> None:
+        """
+        Receiver tells us how many chunks it already has for a transfer we're
+        resuming.  Store next_index and wake the waiting _send_file thread.
+        """
+        tid        = body.get("transfer_id", "")
+        next_index = int(body.get("next_index", 0))
+        self._file_resume_index[tid] = next_index
+        ev = self._file_resume_events.get(tid)
+        if ev:
+            ev.set()
+
     def _handle_system(self, header: dict, ts: str) -> None:
         event = header.get("event", "")
+        _in_quiet = time.monotonic() < self._migration_quiet_until
         if event == "join":
-            uname = header.get("username", "?")
-            utils.log_and_print(self.room, utils.format_system(f"{uname} has joined the chat.", ts))
-            # Refresh users list so the panel updates immediately
+            token = header.get("inbox_token", "")
+            uname = self._token_to_username(token) or header.get("username", token[:8] or "?")
+            if not _in_quiet:
+                utils.log_and_print(self.room, utils.format_system(f"{uname} has joined the chat.", ts))
+            # Re-announce our pubkey so the newcomer can resolve our token → username
+            self._announce_pubkey()
             self._send({"type": "command", "event": "users_req", "room": self.room})
         elif event == "leave":
-            uname  = header.get("username", "?")
+            token  = header.get("inbox_token", "")
+            uname  = self._token_to_username(token) or header.get("username", token[:8] or "?")
             reason = header.get("reason", "disconnect")
-            if reason == "room_change":
-                utils.log_and_print(self.room, utils.format_system(f"{uname} switched rooms.", ts))
-            else:
-                utils.log_and_print(self.room, utils.format_system(f"{uname} has left the chat.", ts))
+            if not _in_quiet:
+                if reason == "room_change":
+                    utils.log_and_print(self.room, utils.format_system(f"{uname} switched rooms.", ts))
+                else:
+                    utils.log_and_print(self.room, utils.format_system(f"{uname} has left the chat.", ts))
+            if not _in_quiet:
                 self._pairwise.pop(uname, None)
                 self._pairwise_raw.pop(uname, None)
                 self._dh_pending.pop(uname, None)
                 self._file_queue.pop(uname, None)
                 self._msg_queue.pop(uname, None)
-            # Refresh users list so the panel updates immediately
             self._send({"type": "command", "event": "users_req", "room": self.room})
         elif event == "nick":
             old = header.get("old_nick", "?").lower()
@@ -1183,12 +1876,26 @@ class NoEyesClient:
     def _handle_command(self, header: dict, ts: str) -> None:
         event = header.get("event", "")
         if event == "users_resp":
-            users = header.get("users", [])
-            room  = header.get("room", self.room)
+            # Use self.room (plain name) not header["room"] (which is a token).
+            room = self.room
+            tokens = header.get("tokens", header.get("users", []))
+            seen = set()
+            users = []
+            for tok in tokens:
+                if tok == self.inbox_token:
+                    name = self.username
+                else:
+                    name = self._token_to_username(tok)
+                    # _token_to_username may match own key if stored in TOFU —
+                    # skip to avoid listing self twice.
+                    if name == self.username:
+                        continue
+                    if not name:
+                        name = tok[:8]
+                if name not in seen:
+                    seen.add(name)
+                    users.append(name)
             utils.set_room_users(room, users)
-            utils.print_msg(utils.cinfo(
-                f"[users] Online in '{room}': " + (", ".join(users) if users else "(none)")
-            ))
 
     # ------------------------------------------------------------------
     # Input loop
@@ -1196,7 +1903,7 @@ class NoEyesClient:
 
     def _input_loop(self) -> None:
         try:
-            while self._running:
+            while self._running or self._migrating:
                 try:
                     line = utils.read_line_noecho()
                 except EOFError:
@@ -1259,8 +1966,15 @@ class NoEyesClient:
             new_room = parts[1]
             self._room_fernet = enc.derive_room_fernet(self._master_key_bytes, new_room)
             self.room = new_room
+            # Clear pairwise state — peers wiped their side on our leave event,
+            # so our keys are stale. DH will re-establish on next /msg.
+            self._pairwise.clear()
+            self._pairwise_raw.clear()
+            self._dh_pending.clear()
             utils.switch_room_display(new_room)
-            self._send({"type": "command", "event": "join_room", "room": new_room})
+            self._send({"type": "command", "event": "join_room", "room": self._room_token()})
+            # Re-announce pubkey so room members can resolve our token → username
+            self._announce_pubkey()
             # Request fresh user list for the new room
             self._send({"type": "command", "event": "users_req", "room": new_room})
             return
@@ -1290,14 +2004,17 @@ class NoEyesClient:
             return
 
         if cmd == "/leave":
-            # Leave current room and return to general
             if self.room == "general":
                 utils.print_msg(utils.cinfo("[leave] You are already in 'general'."))
             else:
                 self._room_fernet = enc.derive_room_fernet(self._master_key_bytes, "general")
                 self.room = "general"
+                self._pairwise.clear()
+                self._pairwise_raw.clear()
+                self._dh_pending.clear()
                 utils.switch_room_display("general")
-                self._send({"type": "command", "event": "join_room", "room": "general"})
+                self._send({"type": "command", "event": "join_room", "room": self._room_token()})
+                self._announce_pubkey()
             return
 
         if cmd == "/msg" and len(parts) >= 3:
@@ -1313,13 +2030,16 @@ class NoEyesClient:
                 self._ensure_dh(peer, then_send=(text, tag))
             return
 
-        if cmd == "/send" and len(parts) >= 3:
-            peer     = parts[1].lower()
-            filepath = parts[2]
-            # Run in background thread — never blocks the input loop
-            threading.Thread(
-                target=self._send_file, args=(peer, filepath), daemon=True
-            ).start()
+        if cmd == "/send":
+            if len(parts) < 3:
+                utils.print_msg(utils.cwarn("[send] Usage: /send <user> <filepath>"))
+            else:
+                peer     = parts[1].lower()
+                filepath = parts[2]
+                # Run in background thread — never blocks the input loop
+                threading.Thread(
+                    target=self._send_file, args=(peer, filepath), daemon=True
+                ).start()
             return
 
         if cmd == "/whoami":
@@ -1351,7 +2071,8 @@ class NoEyesClient:
         utils.print_msg(utils.cwarn(f"[error] Unknown command: {cmd}"))
 
     def _send_file(self, peer: str, filepath: str) -> None:
-        """Initiate a file transfer to *peer*."""
+        """Initiate a file transfer to *peer*, pausing and resuming across bore
+        tunnel outages so every chunk is delivered exactly once."""
         if peer == self.username:
             utils.print_msg(utils.cwarn("[send] Cannot send files to yourself."))
             return
@@ -1362,8 +2083,6 @@ class NoEyesClient:
             return
 
         size = path.stat().st_size
-        # Reject obviously unreasonable files (e.g. 100GB) before even calculating chunks.
-        # 100 GB limit
         _MAX_FILE_SIZE = 100 * 1024 * 1024 * 1024
         if size > _MAX_FILE_SIZE:
             utils.print_msg(utils.cerr(f"[send] File too large: {_human_size(size)} (max 100 GB)"))
@@ -1376,69 +2095,245 @@ class NoEyesClient:
             self._ensure_dh(peer)
             return
 
-        # Calculate chunks
         total_chunks = (size + FILE_CHUNK_SIZE - 1) // FILE_CHUNK_SIZE
-        tid = os.urandom(8).hex()  # transfer ID
+        tid          = os.urandom(8).hex()
 
-        utils.print_msg(utils.cinfo(f"[send] Sending '{filename}' ({_human_size(size)}, {total_chunks} chunk(s)) to {peer}…"))
+        utils.print_msg(utils.cinfo(
+            f"[send] Sending '{filename}' ({_human_size(size)}, {total_chunks} chunk(s)) to {peer}…"
+        ))
 
-        # Send file_start
+        # ── Migration helpers ──────────────────────────────────────────────
+        # How long to wait for a reconnect before giving up entirely.
+        _MIGRATE_WAIT  = 90   # seconds — bore restarts can take 30-60s
+        # Grace window after a send failure in which we decide if it was a
+        # real network error or a bore migration.  We check BOTH the
+        # _reconnect_event (cleared when migration starts) AND self._migrating
+        # (set slightly before _reconnect_event is cleared) so we never mistake
+        # a slow migration detection for a real failure.
+        _MIGRATE_GRACE = 5.0  # seconds
+
+        def _pause_for_migration(label: str) -> bool:
+            """
+            Called after any send failure.
+            Waits up to _MIGRATE_GRACE seconds for evidence that a bore
+            migration is in progress (_reconnect_event cleared OR _migrating
+            set).  Returns True if we should retry, False to abort.
+            """
+            if self._quit:
+                return False
+
+            deadline = time.monotonic() + _MIGRATE_GRACE
+            while time.monotonic() < deadline:
+                # Either signal is enough to confirm a migration is underway.
+                if not self._reconnect_event.is_set() or self._migrating:
+                    break
+                time.sleep(0.05)
+
+            if self._quit:
+                return False
+
+            if self._reconnect_event.is_set() and not self._migrating:
+                # Grace period elapsed without any migration signal — real failure.
+                utils.print_msg(utils.cerr(
+                    f"[send] '{filename}' failed on {label} — connection lost."
+                ))
+                return False
+
+            # Migration confirmed — wait for full reconnect
+            reconnected = self._reconnect_event.wait(timeout=_MIGRATE_WAIT)
+            if not reconnected or self._quit:
+                utils.print_msg(utils.cerr(
+                    f"[send] '{filename}' aborted — reconnect timed out."
+                ))
+                return False
+            return True
+
+        # ── Transfer state ────────────────────────────────────────────────────
         start_body = {
             "filename":     filename,
             "total_size":   size,
             "total_chunks": total_chunks,
             "transfer_id":  tid,
         }
-        self._send_privmsg_encrypted(peer, json.dumps(start_body), tag="file_start")
-
-        # Read and send chunks
-        # Use binary GCM path for efficiency
-        gcm_key = enc.derive_file_cipher_key(self._pairwise_raw[peer], tid)
-
-        import hashlib as _hl
-        sha256 = _hl.sha256()
+        gcm_key   = enc.derive_file_cipher_key(self._pairwise_raw[peer], tid)
         tid_bytes = tid.encode("utf-8")
+        import hashlib as _hl
 
-        try:
-            with open(path, "rb") as f:
-                for idx in range(total_chunks):
-                    chunk = f.read(FILE_CHUNK_SIZE)
-                    if not chunk:
-                        break
+        send_prog: dict = {}   # tracks the single in-place progress line
+        first_attempt = True   # longer ack wait on retries
 
-                    # Hash as we go — no second file read needed
-                    sha256.update(chunk)
+        # ── Outer migration loop ──────────────────────────────────────────────
+        # Each iteration handles one attempt (initial or post-migration resume).
+        # On the first pass we start from chunk 0.  On subsequent passes we ask
+        # the receiver how many chunks it already has via a file_resume_ack so
+        # we can skip ahead rather than restart from 0.
+        while True:
+            # ── Resume handshake ──────────────────────────────────────────────
+            # Register event BEFORE sending file_start so the ack can't arrive
+            # and be dropped between the send and the wait.
+            resume_from = 0
+            resume_ev   = threading.Event()
+            self._file_resume_events[tid] = resume_ev
+            self._file_resume_index.pop(tid, None)
 
-                    gcm_blob = enc.gcm_encrypt(gcm_key, chunk)
-                    frame_payload = (
-                        struct.pack(">I", idx) +
-                        struct.pack(">I", len(tid_bytes)) +
-                        tid_bytes +
-                        gcm_blob
-                    )
-                    header = {
-                        "type":    "privmsg",
-                        "to":      peer,
-                        "from":    self.username,
-                        "subtype": "file_chunk_bin",
-                        "mid":     os.urandom(16).hex(),
-                    }
-                    if not self._send(header, frame_payload):
-                        utils.print_msg(utils.cerr("[send] Transfer interrupted."))
-                        return
+            # (Re-)send file_start.  Receiver replies with file_resume_ack if it
+            # already has partial data for this tid, or stays silent if it has
+            # nothing (first send, or receiver was restarted).
+            while True:
+                if self._send_privmsg_encrypted(peer, json.dumps(start_body), tag="file_start"):
+                    break
+                if not _pause_for_migration("file_start"):
+                    self._file_resume_events.pop(tid, None)
+                    return
 
-                    if total_chunks > 1:
-                        pct = int((idx + 1) / total_chunks * 100)
-                        utils.print_msg(utils.cgrey(f"[send] {pct}%..."))
+            # Short timeout on first attempt (receiver has nothing yet, no ack
+            # expected).  Longer on retries (receiver should respond quickly).
+            ack_timeout = 2.0 if first_attempt else 8.0
+            first_attempt = False
+            resume_ev.wait(timeout=ack_timeout)
+            self._file_resume_events.pop(tid, None)
 
-            # Sign the hash we computed inline — no second file read
+            ack_idx = self._file_resume_index.pop(tid, None)
+            if ack_idx is not None and 0 < ack_idx <= total_chunks:
+                resume_from = ack_idx
+
+            # ── Log resume ────────────────────────────────────────────────────
+            if resume_from > 0:
+                utils.print_msg(utils.cgrey(
+                    f"[send] Resuming '{filename}' from chunk "
+                    f"{resume_from}/{total_chunks}…"
+                ))
+
+            # ── Build SHA-256 state up to resume_from ─────────────────────────
+            # The integrity signature at file_end covers the WHOLE file.  We
+            # fast-forward by hashing the chunks the receiver already wrote so
+            # our running digest stays in sync with the receiver's hasher.
+            sha256 = _hl.sha256()
+            if resume_from > 0:
+                try:
+                    with open(path, "rb") as _f:
+                        for _i in range(resume_from):
+                            _chunk = _f.read(FILE_CHUNK_SIZE)
+                            if not _chunk:
+                                resume_from = _i
+                                break
+                            sha256.update(_chunk)
+                except OSError as e:
+                    utils.print_msg(utils.cerr(f"[send] Error reading file for resume: {e}"))
+                    return
+
+            # ── Clear stale progress line ──────────────────────────────────────
+            if send_prog.get("line"):
+                old = send_prog["line"]
+                with utils._OUTPUT_LOCK:
+                    room = utils._current_room[0]
+                    try: utils._room_logs[room].remove(old)
+                    except ValueError: pass
+                    utils._ephemeral_lines[room].pop(old, None)
+            send_prog.clear()
+
+            # ── Send chunks from resume_from onward ───────────────────────────
+            migration_happened = False
+
+            if resume_from < total_chunks:
+                try:
+                    with open(path, "rb") as f:
+                        f.seek(resume_from * FILE_CHUNK_SIZE)
+                        for idx in range(resume_from, total_chunks):
+                            if self._quit:
+                                return
+
+                            chunk = f.read(FILE_CHUNK_SIZE)
+                            if not chunk:
+                                break
+
+                            sha256.update(chunk)
+                            gcm_blob = enc.gcm_encrypt(gcm_key, chunk)
+                            frame_payload = (
+                                struct.pack(">I", idx) +
+                                struct.pack(">I", len(tid_bytes)) +
+                                tid_bytes +
+                                gcm_blob
+                            )
+                            peer_token = self._peer_inbox_token(peer)
+                            chunk_header = {
+                                "type":    "privmsg",
+                                "to":      peer_token,
+                                "from_token": self.inbox_token,
+                                "subtype": "file_chunk_bin",
+                                "mid":     os.urandom(16).hex(),
+                            }
+
+                            sent = False
+                            while not sent:
+                                if self._send_lo(chunk_header, frame_payload):
+                                    sent = True
+                                else:
+                                    if not _pause_for_migration(
+                                            f"chunk {idx + 1}/{total_chunks}"):
+                                        return
+                                    migration_happened = True
+                                    break
+
+                            if migration_happened:
+                                break
+
+                            if total_chunks > 1:
+                                pct = int((idx + 1) / total_chunks * 100)
+                                last_pct = send_prog.get("last_pct", -1)
+                                if pct != last_pct:
+                                    send_prog["last_pct"] = pct
+                                    new_line = utils.cgrey(f"[send] {filename} {pct}%")
+                                    old_line = send_prog.get("line")
+                                    send_prog["line"] = new_line
+                                    with utils._OUTPUT_LOCK:
+                                        room = utils._current_room[0]
+                                        if old_line and old_line in utils._room_logs[room]:
+                                            utils._room_logs[room].remove(old_line)
+                                        utils._room_logs[room].append(new_line)
+                                        utils._ephemeral_lines[room][new_line] += 1
+                                        if old_line:
+                                            utils._ephemeral_lines[room].pop(old_line, None)
+                                    utils.print_msg(new_line, _skip_log=True)
+
+                except OSError as e:
+                    utils.print_msg(utils.cerr(f"[send] Error reading file: {e}"))
+                    return
+
+            if migration_happened:
+                # Loop again: will send file_start, get ack, skip ahead.
+                continue
+
+            # ── file_end ──────────────────────────────────────────────────────
             sig_hex  = enc.sign_message(self.sk_bytes, sha256.digest()).hex()
             end_body = {"transfer_id": tid, "sig_hex": sig_hex}
-            self._send_privmsg_encrypted(peer, json.dumps(end_body), tag="file_end")
-            utils.print_msg(utils.cok(f"[send] ✓ '{filename}' sent to {peer}."))
+            end_ok   = True
+            while True:
+                if self._send_privmsg_encrypted(peer, json.dumps(end_body), tag="file_end"):
+                    break
+                if not _pause_for_migration("file_end"):
+                    return
+                # Migration at file_end — receiver should have all chunks.
+                # Resume handshake will confirm next_index == total_chunks
+                # so the next iteration skips straight back here.
+                end_ok = False
+                migration_happened = True
+                break
 
-        except OSError as e:
-            utils.print_msg(utils.cerr(f"[send] Error reading file: {e}"))
+            if migration_happened:
+                continue
+
+            break  # ── Transfer complete ─────────────────────────────────────
+
+        utils.print_msg(utils.cok(f"[send] ✓ '{filename}' sent to {peer}."))
+        # Remove progress line from log now that we're done
+        prog_line = send_prog.get("line")
+        if prog_line:
+            with utils._OUTPUT_LOCK:
+                room = utils._current_room[0]
+                try: utils._room_logs[room].remove(prog_line)
+                except ValueError: pass
+                utils._ephemeral_lines[room].pop(prog_line, None)
 
     def _print_help(self) -> None:
         entries = [
@@ -1453,7 +2348,6 @@ class NoEyesClient:
             ("/msg <user> <text>",   "E2E private message",               ""),
             ("/send <user> <path>",  "Send encrypted file",               ""),
             ("/trust <user>",        "Trust key after TOFU mismatch",     ""),
-            ("/anim on|off",         "Toggle decrypt animation",          ""),
             ("/notify on|off",       "Toggle notification sounds",        ""),
             ("/whoami",              "Show identity fingerprint",         ""),
             ("", "[message tags]",   ""),

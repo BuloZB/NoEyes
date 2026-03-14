@@ -1,6 +1,6 @@
 # NoEyes — Secure Terminal Chat
 
-> **End-to-end encrypted group chat, private messages, and file transfer — right in your terminal. The server is a blind forwarder: it cannot read a single byte of your messages, even if fully compromised.**
+> **End-to-end encrypted group chat, private messages, and file transfer — right in your terminal. The server is a blind forwarder: it cannot read a single byte of your messages, does not know your username, does not know the room you are in, and cannot link any two messages to the same person — even if fully compromised.**
 
 ## See it in action
 
@@ -28,10 +28,12 @@ https://github.com/user-attachments/assets/c64bc1f9-352e-4d4d-88a3-66cec53adb4f
 
 ## What is NoEyes?
 
-NoEyes is a Python terminal chat tool for small groups who need real privacy. Unlike every mainstream chat app, the server **never decrypts anything** — it only sees encrypted bytes and routing headers, then forwards them blindly. You generate the key, share it out-of-band, and the server learns nothing about your conversations.
+NoEyes is a Python terminal chat tool for small trusted groups who need real privacy. Unlike every mainstream chat app, the server **never decrypts anything** and **never sees who you are** — it only handles opaque tokens and forwards encrypted bytes blindly.
+
+You generate the key, share it out-of-band, and the server learns nothing about your conversations.
 
 **Who is it for?**
-- Developers and teams who want encrypted comms without trusting a third-party server
+- Small trusted groups who want encrypted comms without trusting any third-party server
 - Anyone who wants to self-host a private chat with true end-to-end encryption
 - Security-minded users who want to understand exactly what a server can and cannot see
 
@@ -41,19 +43,22 @@ NoEyes is a Python terminal chat tool for small groups who need real privacy. Un
 
 | Feature | Details |
 |---|---|
-| **Blind-forwarder server** | Zero decryption — server sees only routing metadata |
+| **Zero-metadata server** | Server never sees usernames, room names, or public keys — only opaque tokens |
+| **Sealed sender** | Sender identity lives inside the encrypted payload, never in the routing header |
+| **Blind-forwarder server** | Zero decryption — server forwards encrypted blobs it cannot read |
 | **Group chat** | Per-room Fernet keys derived via HKDF — rooms cryptographically isolated |
 | **Private messages** | X25519 DH handshake on first contact — pairwise key only the two parties hold |
-| **File transfer** | AES-256-GCM streaming — any size, low RAM usage |
-| **Ed25519 identity** | Auto-generated signing key — all private messages and files are signed |
+| **File transfer** | AES-256-GCM streaming — any size, low RAM usage, pause/resume across reconnects |
+| **Ed25519 identity** | Auto-generated signing key — all messages and files are signed |
 | **TOFU** | First-seen keys trusted; key mismatches trigger a visible security warning |
 | **Random PBKDF2 salt** | Each deployment gets a unique random salt — rainbow tables are useless |
-| **Split sidebar panel** | Rooms (top) and users (bottom) always visible side by side — each half scrolls independently |
+| **TLS + cert pinning** | Transport encrypted, server cert pinned on first contact via TOFU |
+| **Replay protection** | Per-room message ID deque — replayed frames silently dropped |
+| **Split sidebar panel** | Rooms (top) and users (bottom) always visible — each half scrolls independently |
 | **Free text selection** | No mouse capture — drag to copy text freely on all platforms including Termux |
-| **CRT boot animation** | Full-screen phosphor effect with sound on startup — works on all platforms |
+| **CRT boot animation** | Full-screen phosphor effect with sound on startup |
 | **Guided launcher** | Arrow-key menu UI — no command-line experience needed |
 | **Auto dependency installer** | Detects your platform, installs what's missing, asks before changing anything |
-| **Self-updater** | One command to pull the latest version from GitHub |
 
 ---
 
@@ -81,7 +86,6 @@ python ui/launch.py
 | Windows | `install\install.bat` |
 
 Both scripts install Python if missing, then hand off to `setup.py` automatically.
-`install.bat` works from both CMD and PowerShell — no need to run `install.ps1` directly.
 
 ---
 
@@ -103,24 +107,20 @@ python noeyes.py --server --port 5000 --no-bore
 # Start without adding a firewall rule (not needed when using bore tunnel)
 python noeyes.py --server --port 5000 --no-firewall
 
-# 4. Connect clients
-python noeyes.py --connect SERVER_IP --port 5000 --username alice --key-file ./chat.key
-python noeyes.py --connect SERVER_IP --port 5000 --username bob   --key-file ./chat.key
+# 4. Connect clients — each person needs their own identity file
+python noeyes.py --connect SERVER_IP --port 5000 --username alice --key-file ./chat.key --identity-path ~/.noeyes/identity_alice.key
+python noeyes.py --connect SERVER_IP --port 5000 --username bob   --key-file ./chat.key --identity-path ~/.noeyes/identity_bob.key
 ```
+
+> **Important:** Every user must have their own identity file. Two clients sharing the same identity file get the same inbox token and the server will reject the second one as a duplicate session. The identity file is auto-generated on first run — just pass a unique `--identity-path` per user.
 
 ---
 
 ## Running on Termux (Android) — Step by Step
 
+Download Termux from **F-Droid** (recommended): https://f-droid.org/packages/com.termux/
 
-### Termux Tips
-
-Download Termux from **F-Droid** (recommended) or the Play Store.
-F-Droid link: https://f-droid.org/packages/com.termux/
-
-> The F-Droid version is more up to date and receives faster security patches.
-
-**Keep the session alive** — Install tmux so NoEyes keeps running when you switch apps:
+**Keep the session alive** — install tmux so NoEyes keeps running when you switch apps:
 ```bash
 pkg install tmux -y
 tmux
@@ -128,10 +128,12 @@ python ui/launch.py
 # Press Volume Down + D to detach (keeps running in background)
 # tmux attach   to come back
 ```
-**Storage permissions** — file transfer will fail if u don't grant storage access(also clone NoEyes inside /storage/shared/ to access files easily):
+
+**Storage permissions** — file transfer will fail without this:
 ```bash
 termux-setup-storage
 ```
+
 ---
 
 ## In-Chat Commands
@@ -142,14 +144,13 @@ termux-setup-storage
 | `/quit` | Disconnect and exit |
 | `/clear` | Clear screen |
 | `/users` | List users in current room |
-| `/nick <n>` | Change your display name |
+| `/nick <name>` | Change your display name |
 | `/join <room>` | Switch to a room (created automatically) |
 | `/leave` | Return to the general room |
 | `/msg <user> <text>` | Send an E2E-encrypted private message |
 | `/send <user> <file>` | Send an encrypted file |
 | `/whoami` | Show your identity fingerprint |
 | `/trust <user>` | Trust a user's new key after they reinstall |
-| `/anim on\|off` | Toggle the decrypt animation |
 | `/notify on\|off` | Toggle notification sounds |
 
 ---
@@ -158,74 +159,79 @@ termux-setup-storage
 
 | Key | Action |
 |---|---|
-| `\u2191` / `\u2193` | Scroll chat up / down |
+| `↑` / `↓` | Scroll chat up / down |
 | `PgUp` / `PgDn` | Scroll chat one page |
 | `^P` (Ctrl+P) | Show / hide the sidebar panel |
 | `^C` | Quit |
 
 ### Sidebar panel
 
-The chat window has a narrow sidebar on the left that always shows two sections:
+- **Top half — ROOMS** — all rooms joined this session. Active room highlighted with `▶`.
+- **Bottom half — USERS** — everyone currently in your active room.
 
-- **Top half \u2014 ROOMS** \u2014 all rooms you have joined this session. The active room is highlighted with `\u25b6`.
-- **Bottom half \u2014 USERS** \u2014 everyone currently in your active room.
-
-Each half scrolls independently with the mouse wheel. If there are more items than fit, a `+N more` indicator appears at the bottom of that half.
-
-The panel is **display-only** \u2014 no clickable elements, so you can drag to select and copy text freely on all platforms including Termux (no Shift+drag needed). Use `/join <room>` and `/msg <user>` to interact.
-
-Press **`^P`** to hide the panel and get a full-width chat view. Press again to bring it back. Works identically on Linux, Windows Terminal, Termux, and Terminus \u2014 no function key required.
+Each half scrolls independently. Press **`^P`** to hide the panel for a full-width chat view.
 
 ---
 
 ## Message Tags
 
-Prefix any message with a `!tag` to color it for everyone and trigger a notification sound on the receiver's machine. Tags travel **inside the encrypted payload** — the server never sees them.
+Prefix any message with a `!tag` to color it for everyone and trigger a notification sound. Tags travel **inside the encrypted payload** — the server never sees them.
 
-| Tag | Color | Sound | Use for |
-|---|---|---|---|
-| `!ok <msg>` | 🟢 Green | ok | Success, confirmed, done |
-| `!warn <msg>` | 🟡 Yellow | warn | Warning, heads up, be careful |
-| `!danger <msg>` | 🔴 Red | danger | Critical, urgent, emergency |
-| `!info <msg>` | 🔵 Blue | info | Status update, FYI |
-| `!req <msg>` | 🟣 Purple | req | Request, needs someone's action |
-| `!? <msg>` | 🩵 Cyan | ask | Question, asking for input |
+| Tag | Color | Use for |
+|---|---|---|
+| `!ok <msg>` | 🟢 Green | Success, confirmed, done |
+| `!warn <msg>` | 🟡 Yellow | Warning, heads up |
+| `!danger <msg>` | 🔴 Red | Critical, urgent, emergency |
+| `!info <msg>` | 🔵 Blue | Status update, FYI |
+| `!req <msg>` | 🟣 Purple | Request, needs action |
+| `!? <msg>` | 🩵 Cyan | Question, asking for input |
 
 **Examples:**
 ```
 !danger server is going down in 5 minutes
-!req    can someone review my PR?
 !ok     deployment successful
-!warn   disk at 90% on prod
-!?      anyone know why the build is failing?
+!req    can someone review my PR?
 ```
 
-**Sounds** play from `sounds/` folder next to `noeyes.py`. Drop in `.wav`, `.mp3`, `.ogg`, `.aiff`, `.flac`, or `.m4a` files named after the sound type (e.g. `sounds/danger.wav`). If no file is found, falls back to the terminal bell. Use `/notify off` to disable all sounds.
+Sounds play from `sfx/` folder. Drop in `.wav`, `.mp3`, `.ogg`, `.aiff`, `.flac`, or `.m4a` files named after the tag (e.g. `sfx/danger.wav`). Falls back to terminal bell if not found. Use `/notify off` to disable all sounds.
 
 ---
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  Alice ───────────────────────────────────────── Bob         │
-│    │          Encrypted payload (opaque)           │         │
-│    │                     │                         │         │
-│    └───────────► SERVER ─┴◄────────────────────────┘         │
-│                     │                                        │
-│               Blind forwarder:                               │
-│               reads routing header only                      │
-│               { "type":"chat", "room":"general" }            │
-│               forwards encrypted bytes verbatim              │
-└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│  Alice ──────────────────────────────────────────── Bob              │
+│    │          Encrypted payload (opaque)              │              │
+│    │                      │                           │              │
+│    └────────────► SERVER ─┴◄──────────────────────────┘              │
+│                      │                                               │
+│            Zero-metadata blind forwarder:                            │
+│            routes by opaque inbox tokens only                        │
+│            { "to": "3f9a1c...", "type": "privmsg" }                  │
+│            forwards encrypted bytes verbatim                         │
+└──────────────────────────────────────────────────────────────────────┘
 
-WHAT THE SERVER SEES:          WHAT THE SERVER CANNOT SEE:
-  · Usernames                    · Message content
-  · Room names                   · File contents
-  · Event types (join/leave)     · Private message bodies
-  · Frame byte length            · DH key exchange values
-                                 · Ed25519 signatures
+WHAT THE SERVER SEES:              WHAT THE SERVER NEVER SEES:
+  · Encrypted bytes it can't read    · Usernames or display names
+  · Opaque inbox tokens (blake2s)    · Room names
+  · Opaque room tokens (blake2s)     · Who is messaging whom
+  · Frame byte length                · Message content
+  · Connection timing                · File contents
+                                     · Ed25519 public keys
+                                     · DH key exchange values
 ```
+
+### Zero-metadata routing model
+
+Every client computes two opaque tokens locally before connecting:
+
+```
+inbox_token = blake2s(identity_vk_bytes, digest_size=16)
+room_token  = blake2s((room_name + group_key_hex).encode(), digest_size=16)
+```
+
+The server routes all frames by these tokens only. It never stores display names, room names, or public keys. Sender identity travels **inside** the encrypted payload (sealed sender) — not in the routing header.
 
 ### Key derivation chain
 
@@ -246,21 +252,17 @@ X25519 DH (per user pair, automatic on first /msg)
                                   HKDF(transfer_id) ──► aes_gcm_key   (files)
 ```
 
-### Passphrase → key derivation (when using --key PASSPHRASE)
+### Passphrase → key derivation
 
 ```
 passphrase + random_salt (32 bytes, os.urandom)
     │
     └─ PBKDF2-HMAC-SHA256 (390,000 iterations)
               │
-         derived_key  ──► saved to ~/.noeyes/derived.key
-                                      │
-                          loaded directly on every subsequent run
-                          (no PBKDF2 re-derivation, no static salt)
+         derived_key  ──► saved to key file
 ```
 
-Every deployment gets a unique random salt — precomputed rainbow tables
-are useless. After the first run, share the **key file**, not the passphrase.
+Every deployment gets a unique random salt — rainbow tables are useless. After the first run, share the **key file**, not the passphrase.
 
 ---
 
@@ -270,114 +272,69 @@ are useless. After the first run, share the **key file**, not the passphrase.
 |---|---|---|
 | Group chat | Fernet (AES-128-CBC + HMAC-SHA256) | Per-room key via HKDF |
 | Private messages | Fernet with X25519 pairwise key | Ed25519 signed, TOFU verified |
-| File transfer | AES-256-GCM | Per-transfer key, Ed25519 signed |
-| Identity | Ed25519 keypair | Auto-generated at `~/.noeyes/identity.key` |
+| File transfer | AES-256-GCM | Per-transfer key, Ed25519 signed, pause/resume across reconnects |
+| Sender identity | Sealed sender | Username + sig inside encrypted payload, never in routing header |
+| Identity | Ed25519 keypair | Per-user identity file, password-encrypted with PBKDF2 + random salt |
 | Key derivation | PBKDF2-HMAC-SHA256 + random salt | Unique salt per deployment — no rainbow tables |
-| Server | Blind forwarder | Zero decryption — server never holds any keys |
-| Room isolation | `HKDF(master_key, room_name)` | Cryptographically isolated |
-| Transport | TLS (on by default) | TOFU cert pinning — MITM triggers visible warning |
+| Server routing | Opaque blake2s tokens | Server never stores usernames, room names, or public keys |
+| Transport | TLS (on by default) | TOFU cert pinning — fingerprint mismatch aborts connection |
+| DH integrity | Ed25519-signed DH pubkeys | Prevents MITM on pairwise key exchange |
 | Replay protection | Per-room message ID deque | Replayed frames silently dropped |
-| Rate limiting | Separate chat / control buckets | DH flood cannot exhaust chat quota |
+| DoS protection | Connection cap + join timeout + rate limiting | Max 200 connections, 10s join timeout |
+| Room isolation | `HKDF(master_key, room_name)` | Cryptographically isolated per room |
 
----
+### Threat model
 
-## Project Structure
+NoEyes is designed for **small trusted groups**. It provides strong protection against:
 
-```
-NoEyes/
-├── noeyes.py              Entry point and CLI argument parser
-├── requirements.txt       pip dependencies (just: cryptography)
-│
-├── core/
-│   ├── encryption.py      All crypto: Fernet, HKDF, X25519, Ed25519, AES-256-GCM
-│   ├── identity.py        Ed25519 keypair generation and TOFU pubkey store
-│   ├── utils.py           Terminal output, ANSI colours, decrypt animation
-│   └── config.py          Configuration loading and CLI parsing
-│
-├── network/
-│   ├── server.py          Async blind-forwarder server (zero decryption)
-│   └── client.py          Terminal chat client (E2E, DH, TOFU, file transfer)
-│
-├── ui/
-│   ├── launch.py          ★ Guided launcher — arrow-key menu UI
-│   └── setup.py           ★ Dependency wizard — auto-installs everything needed
-│
-├── install/
-│   ├── install.sh         Bootstrap for Linux / macOS / Termux / iSH
-│   ├── install.bat        ★ Bootstrap for Windows (CMD and PowerShell)
-│   ├── install.ps1        Called automatically by install.bat
-│   └── install.py         Cross-platform Python installer
-│
-├── tests/
-│   └── selftest.py        Automated test suite
-│
-├── docs/
-│   ├── README.md
-│   └── CHANGELOG.md
-│
-├── update.py              Self-updater — pulls latest from GitHub
-└── sfx/                   Notification sounds
-```
-
----
-
-## Supported Platforms
-
-`setup.py` automatically detects your platform and installs what's missing:
-
-| Platform | Package manager used |
-|---|---|
-| Ubuntu / Debian / Mint | apt-get |
-| Fedora / RHEL / CentOS | dnf / yum |
-| Arch / Manjaro | pacman |
-| Alpine / iSH (iOS) | apk |
-| openSUSE | zypper |
-| Void Linux | xbps-install |
-| macOS | Homebrew (auto-installed if missing) |
-| Android (Termux) | pkg |
-| Windows | winget / Chocolatey / Scoop |
+- Passive network observers — all traffic is TLS + E2E encrypted
+- Compromised bore.pub relay — relay sees only encrypted bytes and connection timing
+- Compromised server machine — server is zero-knowledge, nothing useful in RAM
+- MITM on connection — TLS cert pinning + Ed25519-signed DH keys
+- Someone stealing your device — identity key is password-encrypted at rest
+- Replay attacks — MID-based per-room replay protection
 
 ---
 
 ## Running a Server Online — bore pub
 
-### The problem: port forwarding is often blocked
+When you start a NoEyes server at home, your machine gets a local IP. For someone outside your network to connect you would normally need to forward a port on your router — in practice this often fails due to CGNAT or carrier-level blocking.
 
-When you start a NoEyes server at home, your machine gets a **local IP** (e.g. `192.168.1.5`). For someone outside your network to connect, you would normally need to open a port on your router and expose your **public IP**. In practice this almost always fails because:
+**bore pub** solves this with a secure tunnel from your machine to a public relay, giving your server an instant public address without touching your router.
 
-- Many ISPs (especially mobile data providers) put customers behind **CGNAT** — you don't even have a real public IP to forward
-- Even with a home router you control, the firewall rules are fiddly and the IP changes
-- Mobile networks routinely block inbound connections at the carrier level, regardless of what your router does
-
-bore pub solves this by creating a **secure tunnel** from your machine to a public relay, giving your server an instant public address without touching your router.
-
----
-
-### What is bore?
-
-**bore** is an open-source TCP tunnel tool written in Rust by [**Eric Zhang** (@ekzhang)](https://github.com/ekzhang/bore).
-
-When you run the NoEyes server, it automatically tries to start:
+**bore** is an open-source TCP tunnel tool by [Eric Zhang (@ekzhang)](https://github.com/ekzhang/bore). When you run the NoEyes server it automatically starts:
 
 ```
 bore local 5000 --to bore.pub
 ```
 
-This punches a tunnel from your local port 5000 to **bore.pub**, a free public relay. The relay assigns you a random port and prints an address like:
-
-```
-bore.pub:12345
-```
-
-You share that address with your friends — they connect with:
+The relay assigns a random port and prints an address like `bore.pub:12345`. Share that with your group:
 
 ```bash
-python noeyes.py --connect bore.pub --port 12345 --key-file ./chat.key
+python noeyes.py --connect bore.pub --port 12345 --key-file ./chat.key --username alice --identity-path ~/.noeyes/identity_alice.key
 ```
 
-**Everything is still end-to-end encrypted.** bore only forwards raw bytes — it cannot read your messages.
+Everything is still end-to-end encrypted — bore only forwards raw bytes.
 
-**Credit:** bore is created and maintained by Eric Zhang. Source: https://github.com/ekzhang/bore
+### Automatic reconnect across bore port changes
+
+bore.pub assigns a **random port on every server restart**. Normally this would mean resharing the address with everyone each time — NoEyes eliminates this entirely with three layers of automatic recovery:
+
+**1 — Migrate event (instant)**
+When bore reassigns a port, the server broadcasts a signed `migrate` event to all connected clients with the new port number. Clients silently disconnect, update their port, and reconnect automatically. A 15-second quiet window suppresses join/leave noise so the chat screen doesn't flash.
+
+**2 — Discovery service (clients who missed the migrate)**
+If a client was offline when the port changed, it polls a free anonymous key-value service (`keyvalue.immanuel.co`) on every reconnect attempt. The server posts the new bore port there automatically each time bore restarts. The lookup key is derived from your group key — no account, no registration, fully anonymous.
+
+**3 — Port in `auth_ok` (crash recovery)**
+If a client missed everything (server crashed, migrate broadcast never sent), the server includes the current bore port in the `auth_ok` handshake response. The client self-corrects on the next successful connect.
+
+The result: **bore.pub port changes are fully transparent to users.** Chat continues automatically within seconds, and file transfers pause and resume from where they left off — no restart from the beginning.
+
+To disable discovery (air-gapped setup or private relay):
+```bash
+python noeyes.py --connect bore.pub --port 12345 --key-file ./chat.key --no-discovery
+```
 
 ---
 
@@ -385,61 +342,25 @@ python noeyes.py --connect bore.pub --port 12345 --key-file ./chat.key
 
 | Limitation | Details |
 |---|---|
-| **No uptime guarantee** | bore.pub is a volunteer service — it can go down at any time |
-| **Shared bandwidth** | Heavy traffic can affect other bore users |
-| **Not for production** | For a team or community, host your own server |
+| **No uptime guarantee** | bore.pub is a volunteer service — it can go down |
 | **Port is random** | Each server start gets a different port — reshare the address |
-| **No authentication** | Anyone who knows your bore.pub address can attempt to connect (your key file still protects all content) |
-
----
+| **Not for production** | For a permanent setup, use a VPS with `--no-bore` |
 
 ### When to use a VPS instead
 
-| Situation | Recommendation |
-|---|---|
-| More than ~10 concurrent users | VPS |
-| Server always online 24/7 | VPS |
-| Stable hostname | VPS |
-| Short session / demo | bore.pub is fine |
-
-**Cheap VPS options:** Hetzner (€4/mo), DigitalOcean ($4/mo), Vultr ($2.50/mo), Oracle Cloud (free tier)
-
-```bash
-# On the VPS — no bore needed, it has a real public IP
-python noeyes.py --server --port 5000 --no-bore
-```
-
----
-
-### Disabling bore
+For more than ~10 users, 24/7 uptime, or a stable hostname, run on a cheap VPS (Hetzner €4/mo, DigitalOcean $4/mo, Oracle Cloud free tier):
 
 ```bash
 python noeyes.py --server --port 5000 --no-bore
 ```
 
-### Firewall rules
+### Firewall notes
 
-When you start a server, NoEyes can automatically add a firewall rule to open the server port so clients can connect directly. The launcher will ask whether you want this and explain when it is needed.
-
-**You do NOT need a firewall rule if you are using bore tunnel** — clients connect via bore.pub and never touch your machine's firewall directly.
-
-You need a firewall rule if clients connect to your IP directly (LAN, static IP, or manual port forwarding).
+You do **not** need a firewall rule when using bore tunnel. You only need one for direct connections (LAN, static IP, manual port forwarding):
 
 ```bash
-# Skip firewall rule (always safe when using bore tunnel)
-python noeyes.py --server --port 5000 --no-firewall
-
-# Skip both bore and firewall rule (VPS with its own firewall managed separately)
-python noeyes.py --server --port 5000 --no-bore --no-firewall
-```
-
----
-
-## Keeping NoEyes Up to Date
-
-```bash
-python update.py           # update to latest version
-python update.py --check   # just check — don't change anything
+python noeyes.py --server --port 5000 --no-firewall        # bore tunnel, skip firewall rule
+python noeyes.py --server --port 5000 --no-bore --no-firewall  # VPS, manage firewall separately
 ```
 
 ---
@@ -460,16 +381,67 @@ cat ~/.noeyes/tofu_pubkeys.json
 
 ---
 
+## Project Structure
+
+```
+NoEyes/
+├── noeyes.py              Entry point and CLI argument parser
+├── requirements.txt       pip dependencies (just: cryptography)
+│
+├── core/
+│   ├── encryption.py      All crypto: Fernet, HKDF, X25519, Ed25519, AES-256-GCM
+│   ├── identity.py        Ed25519 keypair generation and TOFU pubkey store
+│   ├── utils.py           Terminal output, ANSI colours, decrypt animation
+│   └── config.py          Configuration loading and CLI parsing
+│
+├── network/
+│   ├── server.py          Async zero-metadata blind-forwarder server
+│   └── client.py          Terminal chat client (E2E, DH, TOFU, file transfer)
+│
+├── ui/
+│   ├── launch.py          Guided launcher — arrow-key menu UI
+│   └── setup.py           Dependency wizard — auto-installs everything needed
+│
+├── install/
+│   ├── install.sh         Bootstrap for Linux / macOS / Termux / iSH
+│   ├── install.bat        Bootstrap for Windows (CMD and PowerShell)
+│   ├── install.ps1        Called automatically by install.bat
+│   └── install.py         Cross-platform Python installer
+│
+├── docs/
+│   ├── README.md          This file
+│   └── CHANGELOG.md       Version history
+│
+├── update.py              Self-updater — pulls latest from GitHub
+└── sfx/                   Notification sounds
+```
+
+---
+
 ## Tech Stack
 
 - **Language:** Python 3.9+
 - **Encryption:** `cryptography` library — Fernet, X25519, Ed25519, AES-256-GCM, HKDF, PBKDF2
 - **Networking:** Raw TCP sockets with a custom length-prefixed framing protocol
-- **Concurrency:** `threading` (recv + input threads per client), `asyncio` on the server
+- **Concurrency:** `threading` (recv + input + sender threads per client), `asyncio` on the server
 - **Terminal:** ANSI escape codes, `termios` for raw keypress input
 
 ---
 
+## Supported Platforms
+
+| Platform | Package manager used |
+|---|---|
+| Ubuntu / Debian / Mint | apt-get |
+| Fedora / RHEL / CentOS | dnf / yum |
+| Arch / Manjaro | pacman |
+| Alpine / iSH (iOS) | apk |
+| openSUSE | zypper |
+| Void Linux | xbps-install |
+| macOS | Homebrew (auto-installed if missing) |
+| Android (Termux) | pkg |
+| Windows | winget / Chocolatey / Scoop |
+
 ---
 
-⚠️Research & Educational Use Only — experimental project.
+⚠️ Research & Educational Use Only — experimental project.

@@ -1,0 +1,26 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Generated key and identity files
+*.key
+noeyes_config.json
+*.noeyes/
+
+# Received files
+received_files/
+network/files/
+
+# Firewall state
+.noeyes/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp

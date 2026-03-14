@@ -122,6 +122,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        "or when outbound connections to bore.pub are blocked."
                    ))
 
+    p.add_argument("--no-discovery", action="store_true",
+                   help=(
+                       "Disable automatic bore port discovery. "
+                       "When bore.pub kills the tunnel and restarts with a new port, "
+                       "discovery lets clients find the new port automatically. "
+                       "Use this if you do not want any external HTTP calls."
+                   ))
+
     p.add_argument("--no-firewall", action="store_true",
                    help=(
                        "Skip automatic firewall rule creation. "
@@ -187,6 +195,7 @@ def load_config(argv: list[str] | None = None) -> dict[str, Any]:
 
         # Bore tunnel opt-out
         "no_bore":       args.no_bore,
+        "no_discovery":  args.no_discovery,
 
         # Firewall rule opt-out
         "no_firewall":   args.no_firewall,

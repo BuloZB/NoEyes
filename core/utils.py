@@ -15,7 +15,7 @@ import re
 import random
 import threading
 import signal
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 # ---------------------------------------------------------------------------
 # ANSI base helpers
@@ -77,6 +77,23 @@ _MIN_COLS = 44   # minimum cols for two-panel mode
 _IS_WINDOWS = sys.platform == "win32"
 _IS_TERMUX  = "com.termux" in os.environ.get("PREFIX", "") or \
               "termux"     in os.environ.get("HOME",   "").lower()
+
+# Enable ANSI escape codes on Windows (Virtual Terminal Processing).
+# This is a no-op on Windows Terminal (already enabled) but fixes plain
+# cmd.exe and older PowerShell hosts.  Safe to call at import time.
+if _IS_WINDOWS:
+    try:
+        import ctypes as _ctypes
+        _kernel32 = _ctypes.windll.kernel32
+        # Get current stdout console mode and OR in ENABLE_VIRTUAL_TERMINAL_PROCESSING (0x0004)
+        _handle = _kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        _mode   = _ctypes.c_ulong(0)
+        if _kernel32.GetConsoleMode(_handle, _ctypes.byref(_mode)):
+            _kernel32.SetConsoleMode(_handle, _mode.value | 0x0004)
+        # Also set console output to UTF-8 so Unicode chars render correctly
+        _kernel32.SetConsoleOutputCP(65001)
+    except Exception:
+        pass  # non-console environment (redirected output etc.) — ignore
 
 # Input prompt
 _PROMPT     = "\033[96m" + "▶ " + "\033[0m"
@@ -506,6 +523,10 @@ _g_input_active : bool = False
 _g_header       : str  = ""
 _room_logs      : dict = defaultdict(list)
 _room_seen      : dict = defaultdict(set)
+# Lines printed during a migration window that should be removed from the log
+# once the tunnel is restored.  Stored as room → Counter(line_text → count)
+# so identical buffered-notice strings (one per queued message) are all removed.
+_ephemeral_lines: dict = defaultdict(Counter)
 _current_room   : list = ["general"]
 _known_rooms    : list = []   # ordered list of rooms joined this session
 _room_users     : dict = defaultdict(list)  # room -> [username, ...]
@@ -517,6 +538,9 @@ _panel_action_cb       = None  # called with ("join", room) or ("msg", user)
 # ---------------------------------------------------------------------------
 _panel_visible      : list = [True]   # [0] = is panel open
 _panel_rooms_scroll : list = [0]      # [0] = rooms list scroll offset
+_panel_status       : list = [""]     # [0] = tiny status line at bottom of panel
+
+_tunnel_down        : list = [False]  # [0] = True while bore tunnel is down / reconnecting
 _panel_users_scroll : list = [0]      # [0] = users list scroll offset
 
 # ---------------------------------------------------------------------------
@@ -565,6 +589,84 @@ def set_panel_action_cb(cb) -> None:
     action is 'join' (room selected) or 'msg' (user selected)."""
     global _panel_action_cb
     _panel_action_cb = cb
+
+def set_panel_status(text: str) -> None:
+    """Set a tiny one-line status at the bottom of the panel (replaces itself).
+    Pass empty string to clear. Never touches the message log."""
+    _panel_status[0] = text[:_LEFT_W].strip()
+    if _tui_active:
+        with _OUTPUT_LOCK:
+            _tui_draw_rooms_unsafe()
+            sys.stdout.flush()
+
+def print_ephemeral(text: str) -> None:
+    """Print text to the current room's message log AND mark it as ephemeral.
+    Ephemeral lines are removed from the log (and the TUI redrawn) the next
+    time clear_ephemeral_lines() is called — i.e. when the tunnel reconnects.
+    Use for all migration/buffering notices that should vanish on restore."""
+    room = _current_room[0]
+    print_msg(text)
+    # Track by exact rendered string so clear_ephemeral_lines can find and
+    # remove every occurrence even if the same text appears multiple times.
+    _ephemeral_lines[room][text] += 1
+
+def clear_ephemeral_lines() -> None:
+    """Remove every ephemeral line from all room logs and redraw the TUI.
+    Call once when the tunnel is fully restored so migration noise disappears
+    without any flash — the user just sees their clean chat history."""
+    with _OUTPUT_LOCK:
+        changed = False
+        for room, counter in list(_ephemeral_lines.items()):
+            if room not in _room_logs:
+                continue
+            remaining = Counter(counter)
+            new_log = []
+            for line in _room_logs[room]:
+                if remaining.get(line, 0) > 0:
+                    remaining[line] -= 1
+                    changed = True
+                else:
+                    new_log.append(line)
+            _room_logs[room] = new_log
+        _ephemeral_lines.clear()
+        if changed and _tui_active:
+            _tui_soft_redraw_unsafe()
+            sys.stdout.flush()
+
+# ---------------------------------------------------------------------------
+# Tunnel-down notification
+# ---------------------------------------------------------------------------
+
+_PROMPT_NORMAL  = "\033[96m" + "▶ " + "\033[0m"
+_PROMPT_DOWN    = "\033[91m\033[1m" + "⚠ " + "\033[0m"
+
+def is_tunnel_down() -> bool:
+    """Return True while bore tunnel is down and reconnecting."""
+    return _tunnel_down[0]
+
+def set_tunnel_down(down: bool) -> None:
+    """
+    Call with down=True when bore dies unexpectedly — shows a red ⚠ prompt
+    and prints a system notice so the user knows sends are blocked.
+    Call with down=False when the connection is restored — restores the normal
+    prompt and prints a 'reconnected' notice.
+    Both notifications disappear cleanly without disrupting the TUI.
+    """
+    global _PROMPT, _PROMPT_VIS
+    _tunnel_down[0] = down
+    if down:
+        _PROMPT     = _PROMPT_DOWN
+        _PROMPT_VIS = 2
+        print_ephemeral(cwarn("⚠  Tunnel down — messages are buffered and will send on reconnect."))
+    else:
+        _PROMPT     = _PROMPT_NORMAL
+        _PROMPT_VIS = 2
+        # "Tunnel restored" is ephemeral too — clear_ephemeral_lines() called
+        # right after will remove it along with all other migration notices.
+        print_ephemeral(cok("✔  Tunnel restored — sending buffered messages."))
+    if _tui_active:
+        with _OUTPUT_LOCK:
+            _redraw_input_unsafe()
 
 def _fire_panel_action(action: str, name: str) -> None:
     """Fire panel action in a background thread so it doesn't block input."""
@@ -846,6 +948,16 @@ def _tui_draw_rooms_unsafe() -> None:
     _draw_section(" USERS", all_users, _panel_users_scroll,
                   users_start, users_end, "")
 
+    # ── Status line — bottom row of panel, replaces itself ────────────────────
+    status = _panel_status[0]
+    if status and _two_panel():
+        label = status[:_LEFT_W]
+        pad   = max(0, _LEFT_W - len(label))
+        sys.stdout.write(
+            f"\033[{vp_end};1H"
+            + NE_PANEL_DARK + NE_TEXT_TER + label + " " * pad + RESET
+        )
+
 def _tui_draw_divider_unsafe() -> None:
     """Vertical divider between panels. Caller holds _OUTPUT_LOCK."""
     if not _two_panel():
@@ -947,6 +1059,29 @@ def _tui_full_redraw_unsafe() -> None:
         if trail > 0:
             sys.stdout.write(f"\033[{trail}D")
 
+def _tui_soft_redraw_unsafe() -> None:
+    """Repaint the TUI in-place WITHOUT clearing the screen first.
+    Used during bore migration so there is zero black flash — each cell is
+    overwritten directly.  Caller holds _OUTPUT_LOCK."""
+    rows, cols, vp_start, vp_end, sep_row, inp_row = _tui_layout()
+    if rows < 4 or cols < 10:
+        return
+    # Reset scroll margins without clearing, then repaint each region.
+    sys.stdout.write("\033[r")
+    _tui_draw_header_unsafe()
+    if _two_panel():
+        _tui_draw_rooms_unsafe()
+        _tui_draw_divider_unsafe()
+    _tui_draw_viewport_unsafe()
+    _tui_draw_footer_unsafe()
+    sys.stdout.write(f"\033[{inp_row};1H\033[2K{_PROMPT}")
+    if _g_buf:
+        sys.stdout.write("".join(_g_buf))
+        trail = len(_g_buf) - _g_cur
+        if trail > 0:
+            sys.stdout.write(f"\033[{trail}D")
+    sys.stdout.flush()
+
     sys.stdout.write("\033[?25h")
     sys.stdout.flush()
 
@@ -975,13 +1110,19 @@ def _tui_scroll(delta: int) -> None:
 # enter / exit TUI  (cross-platform)
 # ---------------------------------------------------------------------------
 
-def reset_for_reconnect() -> None:
-    """Clear all room logs and scroll state so history replay starts fresh.
-    Call this once per reconnect cycle, before the server sends history."""
+def reset_for_reconnect(is_migration: bool = False) -> None:
+    """Clear room state so history replay starts fresh.
+    During a migration (is_migration=True) we keep _room_logs and _room_seen
+    intact — the already_seen dedup will silently skip replayed messages so
+    the screen never flashes or clears."""
     with _OUTPUT_LOCK:
-        _room_logs.clear()
-        _scroll_offset.clear()
-        _unread_while_away.clear()
+        if not is_migration:
+            _room_logs.clear()
+            _room_seen.clear()
+            _scroll_offset.clear()
+            _unread_while_away.clear()
+            _ephemeral_lines.clear()
+        # During migration: keep everything — already_seen handles dedup
 
 
 def enter_tui() -> None:
@@ -1090,14 +1231,23 @@ def mark_seen(room: str, from_user: str, ts: str, text: str) -> None:
 # Room management
 # ---------------------------------------------------------------------------
 
-def switch_room_display(room_name: str, show_banner: bool = False) -> None:
-    """Switch active room, reset scroll, trigger full TUI redraw."""
+def switch_room_display(room_name: str, show_banner: bool = False,
+                        is_migration: bool = False) -> None:
+    """Switch active room, reset scroll, trigger full TUI redraw.
+
+    Pass is_migration=True during a bore tunnel migration so the scroll
+    position and unread count are preserved — the user stays exactly where
+    they were before the tunnel rolled over.
+    """
     global _g_header
     _current_room[0] = room_name
     if room_name not in _known_rooms:
         _known_rooms.append(room_name)
-    _scroll_offset[room_name]     = 0
-    _unread_while_away[room_name] = 0
+    if not is_migration:
+        # Only reset scroll / unread when actually switching rooms, not when
+        # redrawing after a bore tunnel migration in the same room.
+        _scroll_offset[room_name]     = 0
+        _unread_while_away[room_name] = 0
     # NOTE: do NOT clear _room_logs here — we want history preserved per room
     with _OUTPUT_LOCK:
         _erase_input_unsafe()
@@ -1105,9 +1255,11 @@ def switch_room_display(room_name: str, show_banner: bool = False) -> None:
         _set_title(f"NoEyes \u2502 #{room_name}")
         if _tui_active:
             _tui_size()
-            # Full clear + redraw so old room's messages are completely gone
-            sys.stdout.write("\033[2J")
-            sys.stdout.flush()
+            if not is_migration:
+                # Full clear only when actually switching rooms — during a
+                # bore migration we repaint in-place so there is zero flash.
+                sys.stdout.write("\033[2J")
+                sys.stdout.flush()
             _tui_full_redraw_unsafe()
         elif _is_tty():
             sys.stdout.write("\033[3J\033[2J\033[H\033[r")
@@ -1213,8 +1365,8 @@ def chat_decrypt_animation(
     rendered = format_message(from_user, plaintext, msg_ts, tag=tag, is_own=is_own)
 
     if already_seen(room, from_user, msg_ts, plaintext):
-        _room_logs[room].append(rendered)
-        print_msg(rendered, _skip_log=True)
+        # Already displayed — silently skip during history replay.
+        # Do NOT re-append to _room_logs (it's already there).
         return
 
     if not is_own:
@@ -1247,7 +1399,7 @@ def privmsg_decrypt_animation(
     rendered = format_privmsg(from_user, plaintext, msg_ts, verified, tag=tag)
 
     if already_seen(room, from_user, msg_ts, plaintext):
-        print_msg(rendered)
+        # Already displayed — silently skip during history replay.
         return
 
     if tag and tag in TAGS:
