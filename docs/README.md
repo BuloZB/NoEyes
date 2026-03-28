@@ -55,7 +55,6 @@ Useful for small trusted groups who want encrypted comms without trusting any th
 | **TLS + cert pinning** | Transport encrypted, server cert pinned on first contact via TOFU |
 | **Replay protection** | Per-room message ID deque, replayed frames silently dropped |
 | **Split sidebar panel** | Rooms (top) and users (bottom) always visible, each half scrolls independently |
-| **Free text selection** | No mouse capture, drag to copy text freely on all platforms including Termux |
 | **CRT boot animation** | Full-screen phosphor effect with sound on startup |
 | **Ratchet activation animation** | Full-screen CRT effect with braille gear art, glitch flicker, spotlight sweep, synced SFX, and TUI chrome transition to red |
 | **Guided launcher** | Arrow-key menu UI, no command-line experience needed |
