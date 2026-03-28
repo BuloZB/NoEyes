@@ -1,4 +1,4 @@
-# NoEyes v0.5 — Secure Terminal Chat
+# NoEyes 🔒 Secure Terminal Chat
 
 > **End-to-end encrypted group chat, private messages, and file transfer in your terminal. The server is a blind forwarder: it cannot read your messages, does not know your username, does not know the room you are in, and cannot link any two messages to the same person, even if fully compromised.**
 
@@ -6,25 +6,25 @@
 
 ### Full Showcase - 3 clients, rooms, private messages, sidebar panel
 
-https://github.com/user-attachments/assets/09030d58-491a-46f9-bcfe-e74955b73b70
+https://github.com/user-attachments/assets/d9faabfb-73bd-46dd-92b2-23f63daf5b06
 
 ---
 
 ### install.sh - Bootstrap installer
 
-https://github.com/user-attachments/assets/44a36a30-7057-4db7-a0c3-ee6378232640
+https://github.com/user-attachments/assets/e8e0220d-cd7d-45a2-9443-9a5f20b57f12
 
 ---
 
 ### install.py - Universal Python installer
 
-https://github.com/user-attachments/assets/20920b01-8468-444b-a632-736af2151f8e
+https://github.com/user-attachments/assets/15fb383d-a02a-433e-bbd9-8ebadecf9481
 
 ---
 
 ### Server - Guided launcher startup
 
-https://github.com/user-attachments/assets/00c528a0-68af-4c30-af94-c6b725cbae39
+https://github.com/user-attachments/assets/bca10cb1-6959-425d-96d6-fc1fbf845538
 
 ---
 
