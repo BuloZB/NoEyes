@@ -208,6 +208,8 @@ Sounds play from `sfx/` folder. Drop in `.wav`, `.mp3`, `.ogg`, `.aiff`, `.flac`
 
 ## Architecture
 
+> 🗺️ **[Live Interactive Security Map](https://ymsniper.github.io/NoEyes/)** — Visual breakdown of the full encryption architecture, threat model, and zero-metadata routing in an interactive diagram.
+
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │  Alice ──────────────────────────────────────────── Bob              │
