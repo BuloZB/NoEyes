@@ -1,0 +1,1128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NoEyes — Security Architecture</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@400;700;900&family=Exo+2:wght@300;400;600&display=swap');
+
+*{margin:0;padding:0;box-sizing:border-box}
+
+:root{
+  --bg:#060810;
+  --bg2:#0b0f1a;
+  --bg3:#111827;
+  --panel:#0d1220;
+  --border:#1e2d4a;
+  --glow-blue:#00d4ff;
+  --glow-teal:#00ffcc;
+  --glow-purple:#a855f7;
+  --glow-amber:#f59e0b;
+  --glow-green:#22c55e;
+  --glow-red:#ef4444;
+  --glow-coral:#f97316;
+  --glow-pink:#ec4899;
+  --text:#c8d8f0;
+  --text-dim:#5a7090;
+  --font-mono:'Share Tech Mono',monospace;
+  --font-title:'Orbitron',sans-serif;
+  --font-body:'Exo 2',sans-serif;
+}
+
+html,body{width:100%;height:100%;background:var(--bg);color:var(--text);font-family:var(--font-body);overflow:hidden}
+
+/* HEADER */
+#header{
+  position:fixed;top:0;left:0;right:0;height:52px;
+  background:rgba(6,8,16,.95);border-bottom:1px solid var(--border);
+  display:flex;align-items:center;padding:0 20px;gap:16px;z-index:100;
+  backdrop-filter:blur(8px);
+}
+#header h1{
+  font-family:var(--font-title);font-size:13px;font-weight:700;
+  color:var(--glow-blue);letter-spacing:.15em;text-transform:uppercase;
+  text-shadow:0 0 20px var(--glow-blue);
+}
+#header .tag{
+  font-family:var(--font-mono);font-size:10px;color:var(--text-dim);
+  border:1px solid var(--border);padding:3px 8px;border-radius:3px;
+}
+#header .instructions{
+  margin-left:auto;font-size:11px;color:var(--text-dim);font-family:var(--font-mono);
+}
+
+/* CANVAS */
+#canvas-wrap{position:fixed;top:52px;left:0;right:0;bottom:0}
+#graph-canvas{width:100%;height:100%;display:block}
+
+/* LEGEND */
+#legend{
+  position:fixed;left:16px;bottom:16px;
+  background:rgba(13,18,32,.92);border:1px solid var(--border);
+  border-radius:8px;padding:12px 14px;z-index:50;
+  font-family:var(--font-mono);font-size:10px;backdrop-filter:blur(6px);
+}
+#legend .title{color:var(--text-dim);margin-bottom:8px;letter-spacing:.1em}
+.leg-item{display:flex;align-items:center;gap:7px;margin-bottom:4px;color:var(--text)}
+.leg-dot{width:9px;height:9px;border-radius:50%;flex-shrink:0}
+
+/* DETAIL PANEL */
+#detail{
+  position:fixed;top:62px;right:16px;width:340px;
+  background:var(--panel);border:1px solid var(--border);
+  border-radius:10px;z-index:200;overflow:hidden;
+  transform:translateX(370px);transition:transform .35s cubic-bezier(.2,1,.3,1);
+  box-shadow:0 0 40px rgba(0,0,0,.6);
+  max-height:calc(100vh - 80px);display:flex;flex-direction:column;
+}
+#detail.open{transform:translateX(0)}
+#detail-header{
+  padding:14px 16px 12px;border-bottom:1px solid var(--border);
+  display:flex;align-items:flex-start;gap:10px;flex-shrink:0;
+}
+#detail-icon{width:36px;height:36px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0}
+#detail-title{font-family:var(--font-title);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin-bottom:3px}
+#detail-subtitle{font-family:var(--font-mono);font-size:10px;color:var(--text-dim)}
+#detail-close{margin-left:auto;background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:18px;padding:0;line-height:1;flex-shrink:0}
+#detail-close:hover{color:var(--text)}
+#detail-body{padding:14px 16px;overflow-y:auto;flex:1}
+
+.detail-section{margin-bottom:16px}
+.detail-section-title{
+  font-family:var(--font-mono);font-size:9px;letter-spacing:.15em;
+  text-transform:uppercase;color:var(--text-dim);margin-bottom:8px;
+  border-bottom:1px solid var(--border);padding-bottom:5px;
+}
+.detail-kv{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:5px;gap:8px}
+.detail-k{font-size:11px;color:var(--text-dim);font-family:var(--font-mono);flex-shrink:0}
+.detail-v{font-size:11px;color:var(--text);text-align:right;font-family:var(--font-mono);word-break:break-all}
+.detail-v.mono{font-family:var(--font-mono);font-size:10px}
+.detail-v.highlight{color:var(--glow-teal)}
+.detail-v.warn{color:var(--glow-amber)}
+.detail-v.danger{color:var(--glow-red)}
+.detail-v.good{color:var(--glow-green)}
+
+.code-block{
+  background:rgba(0,0,0,.4);border:1px solid var(--border);border-radius:5px;
+  padding:8px 10px;font-family:var(--font-mono);font-size:10px;
+  color:var(--glow-teal);margin-top:6px;line-height:1.6;white-space:pre-wrap;word-break:break-all;
+}
+
+.flow-steps{margin-top:6px}
+.flow-step{
+  display:flex;gap:8px;align-items:flex-start;margin-bottom:6px;
+  font-size:11px;font-family:var(--font-mono);
+}
+.step-num{
+  width:18px;height:18px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+  font-size:9px;font-weight:700;flex-shrink:0;margin-top:1px;
+}
+.step-text{color:var(--text);line-height:1.5}
+
+.threat-badge{
+  display:inline-block;font-size:9px;font-family:var(--font-mono);
+  padding:2px 7px;border-radius:3px;margin:2px 3px 2px 0;
+}
+.threat-badge.mitigated{background:rgba(34,197,94,.15);color:var(--glow-green);border:1px solid rgba(34,197,94,.3)}
+.threat-badge.partial{background:rgba(245,158,11,.15);color:var(--glow-amber);border:1px solid rgba(245,158,11,.3)}
+
+.relations-wrap{display:flex;flex-wrap:wrap;gap:5px;margin-top:6px}
+.relation-chip{
+  font-size:10px;font-family:var(--font-mono);padding:3px 9px;
+  border-radius:4px;cursor:pointer;border:1px solid;transition:opacity .15s;
+}
+.relation-chip:hover{opacity:.7}
+
+#scan-line{
+  position:fixed;top:52px;left:0;right:0;height:2px;
+  background:linear-gradient(90deg,transparent,rgba(0,212,255,.4),transparent);
+  animation:scan 4s linear infinite;z-index:300;pointer-events:none;
+}
+@keyframes scan{0%{top:52px}100%{top:100vh}}
+
+/* Grid bg */
+#grid-bg{position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:0;opacity:.15}
+
+.tooltip{
+  position:fixed;background:rgba(13,18,32,.95);border:1px solid var(--border);
+  border-radius:6px;padding:7px 11px;font-family:var(--font-mono);font-size:10px;
+  pointer-events:none;z-index:500;max-width:220px;line-height:1.5;
+  transform:translate(-50%,-110%);transition:opacity .15s;
+}
+.tooltip .tt-title{font-weight:700;margin-bottom:3px}
+</style>
+</head>
+<body>
+
+<div id="grid-bg">
+  <svg width="100%" height="100%" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+        <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1e3050" stroke-width="0.5"/>
+      </pattern>
+    </defs>
+    <rect width="100%" height="100%" fill="url(#grid)"/>
+  </svg>
+</div>
+
+<div id="scan-line"></div>
+
+<div id="header">
+  <h1>NoEyes · Security Architecture</h1>
+  <span class="tag">v0.5 · E2EE · Zero-Metadata</span>
+  <span class="tag">Python · PyNaCl · cryptography</span>
+  <span class="instructions">click node to inspect · scroll to zoom · drag to pan</span>
+</div>
+
+<div id="canvas-wrap">
+  <canvas id="graph-canvas"></canvas>
+</div>
+
+<div id="legend">
+  <div class="title">SECURITY LAYERS</div>
+  <div class="leg-item"><div class="leg-dot" style="background:#00ffcc"></div>Crypto Primitives</div>
+  <div class="leg-item"><div class="leg-dot" style="background:#a855f7"></div>Key Hierarchy</div>
+  <div class="leg-item"><div class="leg-dot" style="background:#00d4ff"></div>Zero-Metadata Routing</div>
+  <div class="leg-item"><div class="leg-dot" style="background:#22c55e"></div>Forward Secrecy</div>
+  <div class="leg-item"><div class="leg-dot" style="background:#f59e0b"></div>Identity & TOFU</div>
+  <div class="leg-item"><div class="leg-dot" style="background:#f97316"></div>Transport / TLS</div>
+  <div class="leg-item"><div class="leg-dot" style="background:#ef4444"></div>Access & DoS Protection</div>
+  <div class="leg-item"><div class="leg-dot" style="background:#ec4899"></div>File Transfer</div>
+</div>
+
+<div id="detail">
+  <div id="detail-header">
+    <div id="detail-icon"></div>
+    <div>
+      <div id="detail-title"></div>
+      <div id="detail-subtitle"></div>
+    </div>
+    <button id="detail-close">×</button>
+  </div>
+  <div id="detail-body"></div>
+</div>
+
+<div class="tooltip" id="tooltip" style="opacity:0"></div>
+
+<script>
+// ─── DATA ──────────────────────────────────────────────────────────────────
+const NODES = [
+
+// ── CRYPTO PRIMITIVES (teal) ────────────────────────────────────────────
+{id:'blake2b', label:'BLAKE2b KDF', group:'crypto', icon:'🔗', x:.18, y:.35, size:28,
+ color:'#00ffcc',
+ subtitle:'core/encryption.py · _b2b_derive()',
+ detail:{
+  'Algorithm':'BLAKE2b (PyNaCl)',
+  'Output size':'32 bytes',
+  'Key':'secret (32 bytes)',
+  'Person param':'domain separator (16 bytes)',
+  'Input':'info string + optional material',
+  'Constant time':'HMAC verified via hmac.compare_digest',
+  'Rainbow tables':'Impossible — unique random salt per identity',
+  sections:[
+   {title:'KEY DERIVATION CALLS',items:[
+    ['Room key','blake2b(room_name, key=master, person="room_key_v2")'],
+    ['Pairwise key','blake2b(dh_shared, key=None, person="pairwise_v2")'],
+    ['File key','blake2b(transfer_id, key=pairwise, person="file_key_v2")'],
+    ['Identity key','blake2b(password, key=salt, person="identity_v2")'],
+    ['Migrate chain','blake2b(b"0", key=access, person="migrate_key_0")…×10'],
+    ['Chain KDF','blake2b(b"\\x02", key=chain_key, person="ratchet_chain_v1")'],
+    ['Message key','blake2b(b"\\x01", key=chain_key, person="ratchet_msg_v1")'],
+   ]},
+   {title:'DOMAIN SEPARATION',code:'person="room_key_v2"\nperson="pairwise_v2"\nperson="file_key_v2"\nperson="identity_v2"\nperson="ratchet_chain_v1"\nperson="ratchet_msg_v1"'},
+   {title:'THREATS MITIGATED',threats:['Cross-context key reuse','Rainbow table attacks','Length-extension attacks']},
+  ],
+  relations:['xsalsa','chacha','ratchet_chain','identity_key','room_key','migrate_chain']
+ }
+},
+{id:'xsalsa', label:'XSalsa20-Poly1305', group:'crypto', icon:'🔒', x:.12, y:.55, size:30,
+ color:'#00ffcc',
+ subtitle:'PyNaCl secretbox · group + private messages',
+ detail:{
+  'Algorithm':'XSalsa20-Poly1305 (NaCl secretbox)',
+  'Key size':'32 bytes',
+  'Nonce size':'24 bytes (random per message)',
+  'MAC size':'16 bytes (Poly1305)',
+  'Format':'nonce(24) ‖ ciphertext ‖ mac(16)',
+  'AEAD':'Authenticated — tamper → InvalidToken',
+  'Library':'PyNaCl (libsodium binding)',
+  sections:[
+   {title:'USAGE',items:[
+    ['Group chat','derive_room_box(master, room).encrypt(plaintext)'],
+    ['Private messages','dh_derive_shared_box(priv, pub).encrypt(plaintext)'],
+    ['Ratchet messages','_NaClBox(msg_key).encrypt(plaintext)'],
+    ['Identity at rest','_NaClBox(blake2b(pw,salt)).encrypt(sk_bytes)'],
+   ]},
+   {title:'NONCE STRATEGY',code:'# 24-byte random nonce per message\n# nacl.secret.SecretBox generates internally\n# nonce prepended to ciphertext blob\n# no nonce reuse possible (birthday: 2^96)'},
+   {title:'THREATS MITIGATED',threats:['Passive eavesdropping','Message tampering','Ciphertext forgery','Nonce reuse (probabilistically)']},
+  ],
+  relations:['blake2b','chacha','room_key','pairwise_key','ratchet_chain']
+ }
+},
+{id:'chacha', label:'ChaCha20-Poly1305', group:'crypto', icon:'📦', x:.24, y:.68, size:24,
+ color:'#00ffcc',
+ subtitle:'RFC 8439 · file transfer only',
+ detail:{
+  'Algorithm':'ChaCha20-Poly1305 (RFC 8439)',
+  'Key size':'32 bytes',
+  'Nonce size':'12 bytes (random, os.urandom)',
+  'Tag size':'16 bytes',
+  'Format':'nonce(12) ‖ ciphertext ‖ tag(16)',
+  'Min length check':'28 bytes (prevents truncation attacks)',
+  'Library':'cryptography.hazmat (CFFI/OpenSSL)',
+  sections:[
+   {title:'USAGE',items:[
+    ['File transfer only','gcm_encrypt(key, plaintext) / gcm_decrypt(key, data)'],
+    ['Key derivation','derive_file_cipher_key(pairwise_key, transfer_id)'],
+    ['Note','Named gcm_* for caller compat — actually ChaCha20'],
+   ]},
+   {title:'STREAMING',code:'FILE_CHUNK_SIZE = 512 * 1024  # 512 KB\n# Low RAM: chunks encrypted independently\n# pause/resume: re-derive key from transfer_id\n# transfer_id stable across reconnects'},
+   {title:'THREATS MITIGATED',threats:['File content disclosure','File tampering','Large-file memory exhaustion']},
+  ],
+  relations:['blake2b','file_key','file_transfer']
+ }
+},
+{id:'ed25519', label:'Ed25519', group:'crypto', icon:'✍️', x:.08, y:.42, size:25,
+ color:'#00ffcc',
+ subtitle:'cryptography.hazmat · signatures + TLS cert',
+ detail:{
+  'Algorithm':'Ed25519 (Curve25519 + SHA-512)',
+  'Key size':'32 bytes private / 32 bytes public',
+  'Signature size':'64 bytes',
+  'Properties':'Deterministic, side-channel resistant',
+  'TLS cert':'Self-signed Ed25519 (10 year validity)',
+  'DH pub auth':'Ed25519 signs X25519 DH pubkey offers',
+  sections:[
+   {title:'USAGE',items:[
+    ['Identity','Auto-generated per user, password-encrypted'],
+    ['Message signing','sign_message(sk, plaintext) inside encrypted payload'],
+    ['DH handshake','Signs ephemeral X25519 pubkey to prevent MITM'],
+    ['File transfer','Signs each file before transmission'],
+    ['TLS cert','Self-signed Ed25519 cert generated on server start'],
+   ]},
+   {title:'SEALED SENDER',code:'# Sender identity (username + sig) lives INSIDE\n# the encrypted payload — never in routing header\n# Server routes by opaque token only\n# → server cannot link sender to message'},
+   {title:'THREATS MITIGATED',threats:['Identity impersonation','MITM on DH handshake','Replay (with MID)','Unsigned file injection']},
+  ],
+  relations:['identity_key','tls_layer','dh_exchange','tofu']
+ }
+},
+{id:'x25519', label:'X25519 DH', group:'crypto', icon:'🤝', x:.06, y:.62, size:24,
+ color:'#00ffcc',
+ subtitle:'cryptography.hazmat · pairwise key exchange',
+ detail:{
+  'Algorithm':'X25519 (ECDH on Curve25519)',
+  'Key size':'32 bytes private / 32 bytes public',
+  'Output':'32-byte shared secret',
+  'KDF step':'BLAKE2b(shared_secret, person="pairwise_v2")',
+  'Result':'Pairwise XSalsa20-Poly1305 box',
+  'Signed by':'Ed25519 — prevents MITM on pubkey exchange',
+  sections:[
+   {title:'HANDSHAKE FLOW',steps:[
+    'Alice generates ephemeral X25519 keypair (priv_a, pub_a)',
+    'Alice signs pub_a with Ed25519 sk',
+    'Server forwards signed dh_init to Bob (opaque token routing)',
+    'Bob verifies Alice Ed25519 sig via TOFU vk',
+    'Bob generates ephemeral keypair, signs pub_b, sends dh_resp',
+    'Both derive: shared = X25519(priv, peer_pub)',
+    'Both derive: pairwise_key = BLAKE2b(shared, "pairwise_v2")',
+    'Pairwise NaClBox established — server never sees keys',
+   ]},
+   {title:'THREATS MITIGATED',threats:['Passive key interception','MITM (Ed25519 signed pubkeys)','Server learning pairwise key']},
+  ],
+  relations:['ed25519','blake2b','pairwise_key','tofu']
+ }
+},
+
+// ── KEY HIERARCHY (purple) ────────────────────────────────────────────────
+{id:'chat_key', label:'chat.key', group:'keys', icon:'🗝️', x:.42, y:.12, size:34,
+ color:'#a855f7',
+ subtitle:'Master shared secret · USB-only distribution',
+ detail:{
+  'Format':'JSON v5: {v:5, chat_key:b64, access_key:b64}',
+  'chat_key':'32 bytes (os.urandom) — group encryption master',
+  'access_key':'32 bytes — server auth only, derived separately',
+  'File perms':'0o600 (owner-read only)',
+  'Server?':'chat_key NEVER on server machine',
+  'Distribution':'Out-of-band only (USB drive)',
+  'Version check':'v4 key files rejected with clear error',
+  sections:[
+   {title:'KEY SEPARATION PRINCIPLE',code:'# Server key file: {v:"server", access_key:b64}\n# Client key file:  {v:5, chat_key:b64, access_key:b64}\n#\n# Server ONLY has access_key (for HMAC auth)\n# Server NEVER has chat_key\n# Even full server compromise → no message decryption'},
+   {title:'DERIVATION TREE',code:'chat_key (32 bytes, random)\n  ├─ BLAKE2b("room_key_v2", room) → room_key\n  └─ [never sent to server]\n\naccess_key (32 bytes, random)\n  ├─ BLAKE2b HMAC → connection auth\n  └─ BLAKE2b chain → migrate signing keys ×10'},
+   {title:'THREATS MITIGATED',threats:['Server compromise (no chat_key)','Key file version confusion','File permission disclosure']},
+  ],
+  relations:['blake2b','room_key','access_control','migrate_chain']
+ }
+},
+{id:'room_key', label:'Room Keys', group:'keys', icon:'🚪', x:.35, y:.28, size:24,
+ color:'#a855f7',
+ subtitle:'BLAKE2b(master, room_name) · cryptographically isolated',
+ detail:{
+  'Derivation':'BLAKE2b(room_name, key=master, person="room_key_v2")',
+  'Algorithm':'XSalsa20-Poly1305 (_NaClBox)',
+  'Per-room key':'Yes — each room cryptographically isolated',
+  'Isolation':'Key leakage in one room ≠ access to other rooms',
+  'Server sees':'Only opaque room_token = blake2s(room+key, 16)',
+  sections:[
+   {title:'EXAMPLE',code:'room_token = blake2s(\n  (room_name + group_key_hex).encode(),\n  digest_size=16\n).hexdigest()\n# Server routes by this token only\n# Never stores room_name'},
+   {title:'KEY ISOLATION',code:'BLAKE2b("general") → room_key["general"]\nBLAKE2B("dev")     → room_key["dev"]\nBLAKE2B("ops")     → room_key["ops"]\n# Cross-room decryption: impossible'},
+   {title:'THREATS MITIGATED',threats:['Cross-room message leakage','Server learning room membership','Room name disclosure']},
+  ],
+  relations:['chat_key','blake2b','xsalsa','zero_routing']
+ }
+},
+{id:'pairwise_key', label:'Pairwise Keys', group:'keys', icon:'💬', x:.5, y:.28, size:24,
+ color:'#a855f7',
+ subtitle:'X25519 DH → BLAKE2b · per-user-pair only',
+ detail:{
+  'Derivation':'X25519(priv_a, pub_b) → BLAKE2b("pairwise_v2")',
+  'Algorithm':'XSalsa20-Poly1305 (_NaClBox)',
+  'Scope':'Only the two parties hold this key',
+  'Auto-created':'On first /msg to a user',
+  'Ed25519 auth':'DH pubkeys signed — MITM impossible',
+  sections:[
+   {title:'KEY LIFECYCLE',steps:[
+    'First /msg alice → bob triggers DH handshake',
+    'Ephemeral X25519 keypairs generated for this exchange',
+    'Ed25519 signs each pubkey — TOFU-verified by recipient',
+    'Shared secret derived by both sides independently',
+    'BLAKE2b hardens raw DH output → 32-byte pairwise key',
+    'NaClBox established — persists across reconnects (from memory)',
+   ]},
+   {title:'THREATS MITIGATED',threats:['Server reading private messages','Third party interception','MITM on key exchange']},
+  ],
+  relations:['x25519','ed25519','blake2b','xsalsa','file_key']
+ }
+},
+{id:'file_key', label:'File Transfer Keys', group:'keys', icon:'📁', x:.63, y:.28, size:22,
+ color:'#ec4899',
+ subtitle:'BLAKE2b(pairwise, transfer_id) · ChaCha20-Poly1305',
+ detail:{
+  'Derivation':'BLAKE2b(transfer_id, key=pairwise_key, person="file_key_v2")',
+  'Algorithm':'ChaCha20-Poly1305 (RFC 8439)',
+  'Scope':'Per-transfer — unique key per file',
+  'Transfer ID':'Stable — pause/resume across reconnects',
+  'Chunks':'512 KB each, independently encrypted',
+  'Signed by':'Ed25519 (sender signs file before send)',
+  sections:[
+   {title:'FILE TRANSFER FLOW',steps:[
+    'Alice: /send bob largefile.bin',
+    'Pairwise key must exist (DH handshake first)',
+    'Unique transfer_id generated (random)',
+    'file_key = BLAKE2b(transfer_id, pairwise_key, "file_key_v2")',
+    'File split into 512 KB chunks, each ChaCha20 encrypted',
+    'Chunks sent via privmsg path (opaque token routing)',
+    'Bob decrypts each chunk independently (low RAM)',
+    'Ed25519 signature verified on receipt',
+    'Transfer ID stable — pause/resume safe',
+   ]},
+   {title:'THREATS MITIGATED',threats:['File content interception','File tampering','Memory exhaustion (large files)','Transfer replay']},
+  ],
+  relations:['pairwise_key','blake2b','chacha','file_transfer']
+ }
+},
+{id:'identity_key', label:'Identity Keys', group:'keys', icon:'🪪', x:.28, y:.18, size:26,
+ color:'#a855f7',
+ subtitle:'Ed25519 keypair · password-encrypted at rest',
+ detail:{
+  'Algorithm':'Ed25519 (auto-generated per user)',
+  'Encryption':'XSalsa20-Poly1305 wraps sk_bytes',
+  'KDF':'BLAKE2b(password, key=random_salt, person="identity_v2")',
+  'Salt':'32 bytes os.urandom — unique per identity file',
+  'File format':'{encrypted, sk_enc, vk_hex, id_salt}',
+  'File perms':'0o600',
+  'Sharing':'vk_hex (public key only) announced to room on join',
+  'TOFU':'Other users store your vk_hex on first contact',
+  sections:[
+   {title:'AT-REST ENCRYPTION',code:'id_salt = os.urandom(32)  # unique per file\nbox_key  = BLAKE2b(password, key=id_salt, person="identity_v2")\nsk_enc   = NaClBox(box_key).encrypt(sk_bytes)\n\n# Stored: {encrypted:true, sk_enc:hex, vk_hex:hex, id_salt:hex}\n# Rainbow tables: useless (unique salt per file)'},
+   {title:'UNENCRYPTED OPTION',code:'# If user presses Enter (no password):\n# {encrypted:false, sk_hex:hex, vk_hex:hex}\n# Warning: key readable if device compromised'},
+   {title:'THREATS MITIGATED',threats:['Device theft (encrypted at rest)','Rainbow table attack (random salt)','Identity impersonation (Ed25519 binding)']},
+  ],
+  relations:['ed25519','blake2b','xsalsa','tofu']
+ }
+},
+{id:'migrate_chain', label:'Migrate Key Chain', group:'keys', icon:'🔄', x:.62, y:.14, size:20,
+ color:'#a855f7',
+ subtitle:'10 BLAKE2b-derived keys · rolling anti-replay',
+ detail:{
+  'Length':'10 keys (indices 0–9)',
+  'Derivation':'BLAKE2b(b"0", key=access_key, person="migrate_key_0") ×10',
+  'Usage':'Each bore port migration event uses key[counter % 10]',
+  'Property':'Captured event N cannot be replayed as event N+1',
+  'Both sides':'Server and client derive identically from access_key',
+  sections:[
+   {title:'ANTI-REPLAY MECHANISM',code:'# Server counter increments on each bore restart\nmigrate_key = chain[self._migrate_counter % 10]\nself._migrate_counter += 1\n\n# Client verifies HMAC with same derived key\n# Replayed old event → wrong key → rejected\n# Prevents: fake migrate to attacker-controlled port'},
+   {title:'THREATS MITIGATED',threats:['Migrate event replay attack','Fake port redirection','Bore.pub relay compromise']},
+  ],
+  relations:['chat_key','blake2b','access_control']
+ }
+},
+
+// ── ZERO-METADATA ROUTING (blue) ──────────────────────────────────────────
+{id:'zero_routing', label:'Blind Forwarder', group:'routing', icon:'🕶️', x:.72, y:.45, size:34,
+ color:'#00d4ff',
+ subtitle:'network/server.py · zero-knowledge routing core',
+ detail:{
+  'Model':'Routes by opaque tokens only',
+  'Server sees':'Encrypted bytes, token IDs, frame sizes, timing',
+  'Server never sees':'Usernames, room names, message content, public keys',
+  'RAM state':'No plaintext stored anywhere in server memory',
+  'Compromise':'Full server compromise → no useful data',
+  sections:[
+   {title:'WHAT SERVER SEES vs NEVER SEES',code:'SEES:\n  {to: "3f9a1c...", type: "privmsg"}  ← opaque token\n  encrypted_payload_bytes              ← unreadable\n  frame_byte_length                    ← metadata\n  connection_timing                    ← metadata\n\nNEVER SEES:\n  username, display name\n  room name\n  who is messaging whom\n  Ed25519 public keys\n  DH key exchange values\n  message content, file content'},
+   {title:'ROUTING TOKENS',code:'inbox_token = blake2s(identity_vk_bytes, digest_size=16).hex()\nroom_token  = blake2s(\n  (room_name + group_key_hex).encode(),\n  digest_size=16\n).hex()\n# Both computed CLIENT-SIDE before connecting\n# Server stores only these opaque hex strings'},
+   {title:'SEALED SENDER',code:'# Username + Ed25519 signature sit INSIDE\n# the XSalsa20-Poly1305 encrypted payload\n# Routing header only contains:\n#   {to: inbox_token, type: "chat", mid: "...", ts: "..."}\n# Server cannot extract sender identity'},
+   {title:'THREATS MITIGATED',threats:['Server-side metadata analysis','Subpoena of user data','Traffic correlation (partial)','Server RAM forensics']},
+  ],
+  relations:['inbox_token','room_token','sealed_sender','replay_protect']
+ }
+},
+{id:'inbox_token', label:'Inbox Token', group:'routing', icon:'📬', x:.80, y:.30, size:20,
+ color:'#00d4ff',
+ subtitle:'blake2s(vk_bytes, 16) · opaque user identifier',
+ detail:{
+  'Formula':'blake2s(Ed25519_vk_bytes, digest_size=16).hexdigest()',
+  'Length':'16 bytes = 32 hex chars',
+  'Pre-computed':'Client computes before connecting',
+  'Server stores':'Only this token — never the actual vk_bytes',
+  'Privacy':'Cannot reverse to username or vk without knowing vk',
+  sections:[
+   {title:'TOKEN COMPUTATION',code:'import hashlib\ninbox_token = hashlib.blake2s(\n  identity_vk_bytes,  # 32-byte Ed25519 public key\n  digest_size=16\n).hexdigest()\n# → "3f9a1c8b..." (32 hex chars)\n# Server routes all frames by this value only'},
+   {title:'THREATS MITIGATED',threats:['Username linkability','Public key exposure to server','Identity correlation across sessions']},
+  ],
+  relations:['zero_routing','ed25519','identity_key']
+ }
+},
+{id:'room_token', label:'Room Token', group:'routing', icon:'🏠', x:.80, y:.55, size:20,
+ color:'#00d4ff',
+ subtitle:'blake2s(room+key, 16) · opaque room identifier',
+ detail:{
+  'Formula':'blake2s((room_name + key_hex).encode(), digest_size=16)',
+  'Computed by':'Client only — server never sees room_name',
+  'Keyed by':'chat.key hex string (group secret)',
+  'Isolation':'Different group = different room token even for same name',
+  sections:[
+   {title:'TOKEN COMPUTATION',code:'room_token = hashlib.blake2s(\n  (room_name + group_key_hex).encode("utf-8"),\n  digest_size=16\n).hexdigest()\n# room "general" with key X ≠ room "general" with key Y\n# Server cannot learn room names from tokens'},
+   {title:'THREATS MITIGATED',threats:['Room name disclosure','Cross-group room collision','Room membership inference']},
+  ],
+  relations:['zero_routing','chat_key','room_key']
+ }
+},
+{id:'sealed_sender', label:'Sealed Sender', group:'routing', icon:'✉️', x:.88, y:.43, size:22,
+ color:'#00d4ff',
+ subtitle:'username + sig inside ciphertext · routing header is blind',
+ detail:{
+  'Mechanism':'Sender username + Ed25519 signature live inside encrypted payload',
+  'Routing header':'Only {to, type, mid, ts} — no "from" field',
+  'Server cannot':'Link any two messages to the same sender',
+  'Receiver can':'Decrypt payload, read username, verify Ed25519 sig',
+  sections:[
+   {title:'FRAME STRUCTURE',code:'ROUTING HEADER (server visible):\n  {type:"chat", room:"<token>", mid:"<id>", ts:"14:32:01"}\n\nENCRYPTED PAYLOAD (server opaque):\n  XSalsa20-Poly1305 {\n    username: "alice",\n    text: "hello world",\n    sig: "<ed25519_sig_of_text>"\n  }'},
+   {title:'THREATS MITIGATED',threats:['Server metadata analysis','Sender linkability across messages','Traffic analysis by server']},
+  ],
+  relations:['zero_routing','ed25519','xsalsa']
+ }
+},
+
+// ── FORWARD SECRECY (green) ───────────────────────────────────────────────
+{id:'ratchet_state', label:'Sender Keys Ratchet', group:'ratchet', icon:'⚙️', x:.42, y:.55, size:30,
+ color:'#22c55e',
+ subtitle:'core/ratchet.py · /ratchet start command',
+ detail:{
+  'Protocol':'Sender Keys (Signal-style, adapted for groups)',
+  'Trigger':'/ratchet start → all room members must confirm',
+  'Each user':'Has one SenderChain (own) + N peer SenderChains',
+  'Per-message key':'Unique — derived, used, discarded immediately',
+  'Old keys':'Irrecoverable after chain advances (forward secrecy)',
+  'Visual cue':'TUI chrome turns red + full-screen animation',
+  sections:[
+   {title:'CHAIN KDF (per message)',code:'msg_key    = BLAKE2b(\\x01, key=chain_key, person="ratchet_msg_v1")\nnew_chain  = BLAKE2b(\\x02, key=chain_key, person="ratchet_chain_v1")\n\n# chain_key is REPLACED by new_chain\n# msg_key is used for ONE message then discarded\n# Old chain_key: gone → old msg_key: irrecoverable'},
+   {title:'FAST-FORWARD (missed messages)',code:'# Receiver gets chain_index in each frame header\n# If receiver missed messages N-M:\ndef fast_forward(chain, target_index):\n  while chain.index < target_index:\n    chain._chain_key = BLAKE2b(\\x02, chain._chain_key)\n    chain.index += 1   # skipped keys discarded\n  return chain.advance()  # decrypt target'},
+   {title:'RATCHET STATES',items:[
+    ['Inactive','Normal XSalsa20 with static room key'],
+    ['Proposing','/ratchet start sent, waiting for confirmations'],
+    ['Migration wait','Offline peer — /proceed to drop and resume'],
+    ['Active','Per-message unique keys, TUI turns red'],
+   ]},
+   {title:'THREATS MITIGATED',threats:['Future key compromise revealing past messages','Long-term key capture','Bulk decryption after compromise']},
+  ],
+  relations:['blake2b','xsalsa','ratchet_chain','ratchet_replay']
+ }
+},
+{id:'ratchet_chain', label:'SenderChain', group:'ratchet', icon:'🔗', x:.35, y:.68, size:20,
+ color:'#22c55e',
+ subtitle:'core/ratchet.py · SenderChain class',
+ detail:{
+  'State':'(chain_key: 32 bytes, index: int)',
+  'advance()':'Derives msg_key + new chain_key, increments index',
+  'fast_forward()':'Skips to target_index, discarding intermediate keys',
+  'Backward?':'ValueError — chain is one-directional',
+  'Persistence':'RatchetState.save() → JSON with 0600 perms',
+  sections:[
+   {title:'FORWARD SECRECY GUARANTEE',code:'# After advance():\n#   old_chain_key → gone (overwritten in memory)\n#   msg_key → used for one NaClBox → gone\n# No reference to past keys retained\n# Only current chain_key in RAM\n\n# Even if attacker gets current chain_key:\n#   Past messages remain encrypted\n#   Forward secrecy: ✓'},
+   {title:'THREATS MITIGATED',threats:['Session key compromise (past messages safe)','Chain key leakage (future only)','Replay via chain index check']},
+  ],
+  relations:['ratchet_state','blake2b','xsalsa']
+ }
+},
+{id:'ratchet_replay', label:'Ratchet Replay Guard', group:'ratchet', icon:'🛡️', x:.50, y:.70, size:18,
+ color:'#22c55e',
+ subtitle:'chain_index monotonically increasing · duplicate rejected',
+ detail:{
+  'Mechanism':'chain_index must be ≥ current peer chain index',
+  'Duplicate':'chain_index < current index → InvalidToken raised',
+  'Fast-forward':'chain_index > current → skip (missed messages)',
+  sections:[
+   {title:'REPLAY LOGIC',code:'if chain_index < chain.index:\n    raise InvalidToken(\n      f"Duplicate/replayed: index {chain_index} consumed"\n    )\n# Monotonic index prevents replay within ratchet session\n# Combined with server-side MID deque for transport replay'},
+  ],
+  relations:['ratchet_state','replay_protect']
+ }
+},
+
+// ── IDENTITY & TOFU (amber) ──────────────────────────────────────────────
+{id:'tofu', label:'TOFU Identity', group:'tofu', icon:'🔐', x:.60, y:.58, size:26,
+ color:'#f59e0b',
+ subtitle:'network/client_tofu.py · first-seen key trust',
+ detail:{
+  'Model':'Trust On First Use — first-seen vk_hex stored permanently',
+  'Storage':'~/.noeyes/tofu_pubkeys.json',
+  'First contact':'Trusted, printed: "[tofu] Trusted new key for alice"',
+  'Key change':'SECURITY WARNING + messages marked with ⚠ marker',
+  'Recovery':'/trust <user> accepts new key after reinstall',
+  sections:[
+   {title:'TRUST FLOW',steps:[
+    'User joins room → broadcasts {type:"pubkey_announce", vk_hex:hex}',
+    'Recipients call trust_or_verify(store, username, vk_hex)',
+    'First contact: store[username]=vk_hex, saved to disk',
+    'Subsequent: hmac.compare_digest(stored, incoming)',
+    'Mismatch: SECURITY WARNING + messages quarantined',
+    'User runs /trust to accept new key intentionally',
+   ]},
+   {title:'TLS CERT TOFU',code:'# Separate TOFU store: ~/.noeyes/tls_tofu.json\n# Stores SHA-256 fingerprint of server TLS cert\n# Mismatch → connection aborted immediately\n# Even cert re-generation triggers warning'},
+   {title:'THREATS MITIGATED',threats:['Silent key substitution (MITM)','Impersonation after reinstall','Rogue server cert injection']},
+  ],
+  relations:['ed25519','identity_key','tls_layer','dh_exchange']
+ }
+},
+
+// ── TRANSPORT / TLS (coral) ──────────────────────────────────────────────
+{id:'tls_layer', label:'TLS Layer', group:'transport', icon:'🌐', x:.72, y:.20, size:26,
+ color:'#f97316',
+ subtitle:'core/encryption.py · generate_tls_cert · TOFU pinning',
+ detail:{
+  'Algorithm':'TLS 1.2+ (Python ssl module, OpenSSL)',
+  'Cert type':'Self-signed Ed25519 (not RSA — consistent with key stack)',
+  'Validity':'10 years (not CA-signed — TOFU instead)',
+  'Pinning':'SHA-256 fingerprint stored in tls_tofu.json',
+  'Mismatch':'Connection aborted immediately',
+  '--no-tls':'Flag available for LAN / air-gapped setups',
+  sections:[
+   {title:'CERT TOFU FLOW',steps:[
+    'Server generates Ed25519 self-signed cert on first start',
+    'Client connects → TLS handshake (standard)',
+    'Client computes SHA-256 fingerprint of server cert',
+    'First connect: store fingerprint in tls_tofu.json (0600)',
+    'Subsequent: compare stored fingerprint — mismatch → abort',
+    'Note: E2EE layer independent of TLS (defense in depth)',
+   ]},
+   {title:'DEFENSE IN DEPTH',code:'Transport: TLS (prevents passive sniffing)\nE2EE layer: XSalsa20 (independently encrypted)\n\n# Even if TLS is stripped by a relay:\n# E2EE layer remains intact\n# Messages still unreadable without chat.key'},
+   {title:'THREATS MITIGATED',threats:['Passive network sniffing','TLS cert substitution (TOFU)','Bore relay compromise (E2EE backup)']},
+  ],
+  relations:['ed25519','tofu','wire_framing','zero_routing']
+ }
+},
+{id:'wire_framing', label:'Wire Framing', group:'transport', icon:'📡', x:.58, y:.78, size:22,
+ color:'#f97316',
+ subtitle:'client_framing.py · 8-byte size prefix · attack surface',
+ detail:{
+  'Format':'[header_len: 4B big-endian] [payload_len: 4B] [header JSON] [payload bytes]',
+  'Header max':'65,536 bytes (enforced, dropped if exceeded)',
+  'Payload max':'16 MB (enforced, dropped if exceeded)',
+  'Header':'JSON, UTF-8 encoded — invalid → dropped silently',
+  'Payload':'Binary (encrypted ciphertext bytes)',
+  sections:[
+   {title:'FRAME LAYOUT',code:'┌──────────────────────────────────────────┐\n│ header_len (4B) │ payload_len (4B)        │\n├──────────────────────────────────────────┤\n│ JSON header (header_len bytes)           │\n│ {type, to, mid, ts, ...routing only}     │\n├──────────────────────────────────────────┤\n│ Binary payload (payload_len bytes)       │\n│ [XSalsa20-Poly1305 ciphertext]           │\n└──────────────────────────────────────────┘'},
+   {title:'BOUNDS CHECKS',code:'if header_len > 65536:  drop  # buffer overflow guard\nif payload_len > 16MB:  drop  # DoS guard\nif not valid UTF-8 JSON: drop  # parse bomb guard\nif len(data) < 8:        return None  # truncation guard'},
+   {title:'THREATS MITIGATED',threats:['Buffer overflow via oversized header','Memory exhaustion via huge payload','Parse bomb via malformed JSON','Truncation attacks']},
+  ],
+  relations:['tls_layer','access_control','zero_routing']
+ }
+},
+
+// ── ACCESS & DOS PROTECTION (red) ──────────────────────────────────────────
+{id:'access_control', label:'Access Control', group:'dos', icon:'🔑', x:.22, y:.80, size:26,
+ color:'#ef4444',
+ subtitle:'BLAKE2b HMAC challenge · server-side only access_key',
+ detail:{
+  'Mechanism':'BLAKE2b keyed MAC challenge-response on connect',
+  'Key':'access_key (32 bytes) — shared server + clients via chat.key',
+  'Nonce':'Random server-generated nonce per connection attempt',
+  'Constant time':'hmac.compare_digest prevents timing attacks',
+  'On failure':'Connection rejected immediately',
+  sections:[
+   {title:'AUTH HANDSHAKE',steps:[
+    'Client connects → TLS handshake',
+    'Server sends: {type:"auth_challenge", nonce:"<random_hex>"}',
+    'Client computes: BLAKE2b(nonce, key=access_key)',
+    'Client sends: {type:"auth_response", hmac:"<hex>"}',
+    'Server verifies with hmac.compare_digest',
+    'Success: {type:"auth_ok", bore_port:N} (bore port for recovery)',
+    'Failure: disconnect immediately',
+   ]},
+   {title:'MIGRATE AUTH',code:'# Each bore port change signed with rolling key chain\nmigrate_key = chain[counter % 10]  # derived from access_key\nhmac = BLAKE2b(f"migrate:{new_port}", key=migrate_key)\n# Client verifies — wrong key chain index → reject\n# Captured old migrate event: wrong key → reject'},
+   {title:'THREATS MITIGATED',threats:['Unauthorized connections','Migrate event replay','Timing attack on MAC verification','Fake bore port redirection']},
+  ],
+  relations:['chat_key','migrate_chain','blake2b','rate_limit']
+ }
+},
+{id:'rate_limit', label:'Rate & DoS Limits', group:'dos', icon:'⚡', x:.10, y:.78, size:22,
+ color:'#ef4444',
+ subtitle:'server_rooms.py · connection cap + per-client rate limits',
+ detail:{
+  'Max connections':'200 (asyncio.Semaphore)',
+  'Message rate':'30 messages/minute per client (sliding window)',
+  'Control frames':'Separate bucket — DH/pubkey_announce not counted as chat',
+  'Join timeout':'10 seconds to complete auth handshake',
+  'PRIVMSG pair limit':'25 messages per pair per 900 seconds',
+  'Replay window':'1000 MIDs per room (deque)',
+  sections:[
+   {title:'RATE LIMIT CODE',code:'MAX_CONNECTIONS     = 200\nPRIVMSG_PAIR_LIMIT  = 25\nPRIVMSG_PAIR_WINDOW = 900   # seconds\nREPLAY_WINDOW_SIZE  = 1000\n\ndef check_rate_limit(limit_per_minute, *, control=False):\n    bucket = ctrl_times if control else msg_times\n    # sliding 60s window\n    while bucket and (now - bucket[0]) > 60:\n        bucket.popleft()\n    if len(bucket) >= limit: return False\n    bucket.append(now)\n    return True'},
+   {title:'PRIVMSG RATE',code:'# Pair key: BLAKE2b(sorted(token_a, token_b), salt)\n# salt = os.urandom(32) at server start\n# Prevents: knowing the pair key outside server RAM\n# 25 privmsg per pair per 15 minutes\n# Prevents: privmsg flooding / spam DoS'},
+   {title:'THREATS MITIGATED',threats:['Connection flooding (Semaphore cap)','Message spam DoS (rate limiter)','PRIVMSG abuse (pair limit)','Replay attacks (MID deque)']},
+  ],
+  relations:['replay_protect','access_control','wire_framing']
+ }
+},
+{id:'replay_protect', label:'Replay Protection', group:'dos', icon:'🔁', x:.16, y:.65, size:22,
+ color:'#ef4444',
+ subtitle:'server_rooms.py · per-room MID deque(maxlen=1000)',
+ detail:{
+  'Per-room MID':'deque(maxlen=1000) — sliding window',
+  'Per-privmsg MID':'deque(maxlen=1000)',
+  'MID format':'Client-generated UUID/random string',
+  'On duplicate':'check_mid_*() returns True → frame silently dropped',
+  'Ratchet layer':'chain_index monotonically increases (extra protection)',
+  sections:[
+   {title:'DEQUE LOGIC',code:'_room_mids: defaultdict(lambda: deque(maxlen=1000))\n_priv_mids: deque(maxlen=1000)\n\ndef check_mid_chat(room, mid):\n    if mid in self._room_mids[room]: return True  # replay\n    self._room_mids[room].append(mid)\n    return False  # new message\n\n# Window = 1000 most recent MIDs per room\n# Old MIDs evicted — very old replays not detected\n# (intentional: protects against network-level replay)'},
+   {title:'THREATS MITIGATED',threats:['Network-level message replay','Duplicate delivery','Ratchet message replay (chain index)']},
+  ],
+  relations:['zero_routing','rate_limit','ratchet_replay']
+ }
+},
+
+// ── FILE TRANSFER (pink) ──────────────────────────────────────────────────
+{id:'file_transfer', label:'File Transfer', group:'file', icon:'🗂️', x:.72, y:.72, size:24,
+ color:'#ec4899',
+ subtitle:'network/client_send.py · streaming ChaCha20-Poly1305',
+ detail:{
+  'Algorithm':'ChaCha20-Poly1305 (per-chunk)',
+  'Chunk size':'512 KB (FILE_CHUNK_SIZE)',
+  'Key scope':'Per-transfer (unique transfer_id)',
+  'Routing':'privmsg path — opaque tokens (server blind)',
+  'Signature':'Ed25519 signs file metadata before send',
+  'Pause/resume':'transfer_id stable across reconnects',
+  'Storage':'received_files/{images,videos,audio,docs,other}/',
+  sections:[
+   {title:'SECURITY PROPERTIES',items:[
+    ['Server sees','Encrypted chunks, size, token — not content'],
+    ['File type','Inferred from extension (client-side only)'],
+    ['Key per transfer','BLAKE2b(pairwise, transfer_id, "file_key_v2")'],
+    ['Integrity','ChaCha20 tag + Ed25519 signature = double verification'],
+    ['RAM usage','O(chunk) not O(file) — safe for large files'],
+   ]},
+   {title:'DESTINATION SAFETY',code:'def _unique_dest(filename):\n    # Files sorted into sub-folders by type\n    # Collision-safe: appends _1, _2 suffix\n    # Prevents overwrite of existing files\n    # No path traversal check visible — potential gap'},
+   {title:'THREATS MITIGATED',threats:['File content interception','File tampering (AEAD + sig)','Memory exhaustion (512KB chunks)','Transfer correlation by server']},
+  ],
+  relations:['chacha','file_key','pairwise_key','ed25519','zero_routing']
+ }
+},
+
+];
+
+// Edge definitions
+const EDGES = [
+  {from:'blake2b',to:'room_key',label:'derives',strength:1},
+  {from:'blake2b',to:'pairwise_key',label:'hardens DH',strength:1},
+  {from:'blake2b',to:'identity_key',label:'KDF',strength:1},
+  {from:'blake2b',to:'migrate_chain',label:'chain KDF',strength:.8},
+  {from:'blake2b',to:'ratchet_chain',label:'chain/msg KDF',strength:1},
+  {from:'blake2b',to:'file_key',label:'derives',strength:.9},
+  {from:'blake2b',to:'access_control',label:'HMAC MAC',strength:1},
+  {from:'chat_key',to:'room_key',label:'master',strength:1},
+  {from:'chat_key',to:'access_control',label:'access_key split',strength:1},
+  {from:'chat_key',to:'migrate_chain',label:'seeds',strength:.8},
+  {from:'room_key',to:'xsalsa',label:'group encrypt',strength:1},
+  {from:'pairwise_key',to:'xsalsa',label:'private encrypt',strength:1},
+  {from:'pairwise_key',to:'file_key',label:'seeds',strength:.9},
+  {from:'file_key',to:'chacha',label:'file encrypt',strength:1},
+  {from:'x25519',to:'pairwise_key',label:'DH output',strength:1},
+  {from:'x25519',to:'ed25519',label:'signed by',strength:1},
+  {from:'ed25519',to:'identity_key',label:'keypair',strength:1},
+  {from:'ed25519',to:'tls_layer',label:'TLS cert',strength:.9},
+  {from:'ed25519',to:'tofu',label:'vk stored',strength:1},
+  {from:'ed25519',to:'sealed_sender',label:'signs payload',strength:1},
+  {from:'ed25519',to:'file_transfer',label:'signs file',strength:.8},
+  {from:'identity_key',to:'tofu',label:'vk_hex announced',strength:1},
+  {from:'identity_key',to:'inbox_token',label:'vk→token',strength:1},
+  {from:'xsalsa',to:'ratchet_chain',label:'per-msg encrypt',strength:1},
+  {from:'ratchet_state',to:'ratchet_chain',label:'uses',strength:1},
+  {from:'ratchet_state',to:'ratchet_replay',label:'index guard',strength:.9},
+  {from:'tls_layer',to:'wire_framing',label:'wraps',strength:1},
+  {from:'wire_framing',to:'zero_routing',label:'frames',strength:1},
+  {from:'zero_routing',to:'inbox_token',label:'routes by',strength:1},
+  {from:'zero_routing',to:'room_token',label:'routes by',strength:1},
+  {from:'zero_routing',to:'sealed_sender',label:'blind to sender',strength:1},
+  {from:'zero_routing',to:'replay_protect',label:'MID deque',strength:.9},
+  {from:'access_control',to:'rate_limit',label:'post-auth',strength:.8},
+  {from:'access_control',to:'wire_framing',label:'on connect',strength:.8},
+  {from:'rate_limit',to:'replay_protect',label:'layered with',strength:.7},
+  {from:'file_transfer',to:'file_key',label:'uses',strength:1},
+  {from:'file_transfer',to:'zero_routing',label:'privmsg path',strength:.8},
+  {from:'tofu',to:'tls_layer',label:'cert pinning',strength:.9},
+  {from:'room_key',to:'room_token',label:'token derived with',strength:.8},
+  {from:'migrate_chain',to:'access_control',label:'migrate auth',strength:.9},
+];
+
+// ─── RENDERER ───────────────────────────────────────────────────────────────
+const canvas = document.getElementById('graph-canvas');
+const ctx    = canvas.getContext('2d');
+let W, H, scale = 1, pan = {x:0, y:0}, dragging = false, lastMouse = null;
+let selectedNode = null, hoveredNode = null;
+let particles = [];
+
+function resize(){
+  W = canvas.width  = window.innerWidth;
+  H = canvas.height = window.innerHeight - 52;
+}
+window.addEventListener('resize', resize);
+window.addEventListener('load', ()=>{ resize(); frame(); });
+
+function nodePos(n){
+  return {
+    x: pan.x + n.x * W * scale,
+    y: pan.y + n.y * H * scale
+  };
+}
+
+function nodeAt(mx, my){
+  for(let n of NODES){
+    const p = nodePos(n);
+    const r = (n.size * scale);
+    if(Math.hypot(mx - p.x, my - p.y) < r) return n;
+  }
+  return null;
+}
+
+// ── DRAW ─────────────────────────────────────────────────────────────────
+function hexToRgb(hex, a=1){
+  const r = parseInt(hex.slice(1,3),16);
+  const g = parseInt(hex.slice(3,5),16);
+  const b = parseInt(hex.slice(5,7),16);
+  return `rgba(${r},${g},${b},${a})`;
+}
+
+function drawEdge(e){
+  const from = NODES.find(n=>n.id===e.from);
+  const to   = NODES.find(n=>n.id===e.to);
+  if(!from||!to) return;
+  const fp = nodePos(from), tp = nodePos(to);
+  const alpha = (hoveredNode && (hoveredNode.id===from.id||hoveredNode.id===to.id)) ? .8 : .2;
+  const highlight = selectedNode && (selectedNode.id===from.id||selectedNode.id===to.id);
+
+  ctx.save();
+  ctx.beginPath();
+  const mx = (fp.x+tp.x)/2 - (tp.y-fp.y)*.12;
+  const my = (fp.y+tp.y)/2 + (tp.x-fp.x)*.12;
+  ctx.moveTo(fp.x, fp.y);
+  ctx.quadraticCurveTo(mx, my, tp.x, tp.y);
+  ctx.strokeStyle = highlight
+    ? hexToRgb(from.color, .9)
+    : hexToRgb(from.color, alpha * e.strength);
+  ctx.lineWidth = highlight ? 2 : 1;
+  if(!highlight) ctx.setLineDash([4,6]);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // arrow
+  const t = .9;
+  const ax = (1-t)*(1-t)*fp.x + 2*(1-t)*t*mx + t*t*tp.x;
+  const ay = (1-t)*(1-t)*fp.y + 2*(1-t)*t*my + t*t*tp.y;
+  const bx = (1-.95)*(1-.95)*fp.x + 2*(1-.95)*.95*mx + .95*.95*tp.x;
+  const by = (1-.95)*(1-.95)*fp.y + 2*(1-.95)*.95*my + .95*.95*tp.y;
+  const angle = Math.atan2(ay-by, ax-bx);
+  ctx.beginPath();
+  ctx.moveTo(tp.x, tp.y);
+  ctx.lineTo(tp.x - 8*Math.cos(angle-0.4), tp.y - 8*Math.sin(angle-0.4));
+  ctx.lineTo(tp.x - 8*Math.cos(angle+0.4), tp.y - 8*Math.sin(angle+0.4));
+  ctx.closePath();
+  ctx.fillStyle = hexToRgb(from.color, (highlight?.7:alpha*.8) * e.strength);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawNode(n){
+  const p = nodePos(n);
+  const r = n.size * scale;
+  const isHovered  = hoveredNode  && hoveredNode.id  === n.id;
+  const isSelected = selectedNode && selectedNode.id === n.id;
+  const brightness = isSelected ? 1 : isHovered ? .9 : .6;
+
+  // glow
+  const glowR = isSelected ? r * 2.5 : isHovered ? r * 2 : r * 1.5;
+  const grd = ctx.createRadialGradient(p.x, p.y, r*.3, p.x, p.y, glowR);
+  grd.addColorStop(0, hexToRgb(n.color, brightness * .35));
+  grd.addColorStop(1, hexToRgb(n.color, 0));
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, glowR, 0, Math.PI*2);
+  ctx.fillStyle = grd;
+  ctx.fill();
+
+  // ring
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, r+2, 0, Math.PI*2);
+  ctx.strokeStyle = hexToRgb(n.color, isSelected ? 1 : .4);
+  ctx.lineWidth = isSelected ? 2 : 1;
+  ctx.stroke();
+
+  // body
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, r, 0, Math.PI*2);
+  ctx.fillStyle = hexToRgb(n.color, brightness * .18);
+  ctx.fill();
+
+  // icon
+  ctx.font = `${r * .7}px sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(n.icon, p.x, p.y - r*.05);
+
+  // label
+  const labelAlpha = isHovered || isSelected ? 1 : .75;
+  ctx.font = `${Math.max(9, 11*scale)}px "Share Tech Mono", monospace`;
+  ctx.fillStyle = hexToRgb(n.color, labelAlpha);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  const labelY = p.y + r + 5;
+  ctx.fillText(n.label, p.x, labelY);
+}
+
+// particles
+function spawnParticles(e){
+  const from = NODES.find(n=>n.id===e.from);
+  const to   = NODES.find(n=>n.id===e.to);
+  if(!from||!to) return;
+  if(Math.random()>.04) return;
+  particles.push({e, t:0, speed:.004+Math.random()*.004});
+}
+
+function drawParticle(p){
+  const from = NODES.find(n=>n.id===p.e.from);
+  const to   = NODES.find(n=>n.id===p.e.to);
+  const fp = nodePos(from), tp = nodePos(to);
+  const mx = (fp.x+tp.x)/2 - (tp.y-fp.y)*.12;
+  const my = (fp.y+tp.y)/2 + (tp.x-fp.x)*.12;
+  const t = p.t;
+  const x = (1-t)*(1-t)*fp.x + 2*(1-t)*t*mx + t*t*tp.x;
+  const y = (1-t)*(1-t)*fp.y + 2*(1-t)*t*my + t*t*tp.y;
+  ctx.beginPath();
+  ctx.arc(x, y, 2.5, 0, Math.PI*2);
+  ctx.fillStyle = hexToRgb(from.color, .9);
+  ctx.fill();
+  // trail
+  const t2 = Math.max(0,t-.05);
+  const x2 = (1-t2)*(1-t2)*fp.x + 2*(1-t2)*t2*mx + t2*t2*tp.x;
+  const y2 = (1-t2)*(1-t2)*fp.y + 2*(1-t2)*t2*my + t2*t2*tp.y;
+  ctx.beginPath();
+  ctx.moveTo(x,y);
+  ctx.lineTo(x2,y2);
+  ctx.strokeStyle = hexToRgb(from.color, .4);
+  ctx.lineWidth=1.5;
+  ctx.stroke();
+}
+
+function frame(){
+  ctx.clearRect(0,0,W,H);
+
+  // draw edges
+  for(const e of EDGES) drawEdge(e);
+
+  // spawn & draw particles
+  for(const e of EDGES) spawnParticles(e);
+  particles = particles.filter(p=>{
+    p.t += p.speed;
+    if(p.t >= 1) return false;
+    drawParticle(p);
+    return true;
+  });
+
+  // draw nodes
+  for(const n of NODES) drawNode(n);
+
+  requestAnimationFrame(frame);
+}
+
+// ── INTERACTION ──────────────────────────────────────────────────────────
+canvas.addEventListener('mousemove', e=>{
+  const r = canvas.getBoundingClientRect();
+  const mx = e.clientX - r.left;
+  const my = e.clientY - r.top;
+
+  if(dragging && lastMouse){
+    pan.x += mx - lastMouse.x;
+    pan.y += my - lastMouse.y;
+  }
+  lastMouse = {x:mx, y:my};
+
+  const n = nodeAt(mx, my);
+  hoveredNode = n;
+  canvas.style.cursor = n ? 'pointer' : (dragging ? 'grabbing' : 'grab');
+
+  const tt = document.getElementById('tooltip');
+  if(n){
+    tt.style.opacity = '1';
+    tt.style.left = (e.clientX)+'px';
+    tt.style.top  = (e.clientY)+'px';
+    tt.innerHTML = `<div class="tt-title" style="color:${n.color}">${n.icon} ${n.label}</div><div style="color:#8899aa">${n.subtitle}</div>`;
+  } else {
+    tt.style.opacity = '0';
+  }
+});
+
+canvas.addEventListener('mousedown', e=>{
+  dragging = true;
+  canvas.style.cursor = 'grabbing';
+});
+
+canvas.addEventListener('mouseup', e=>{
+  dragging = false;
+  canvas.style.cursor = 'grab';
+});
+
+canvas.addEventListener('click', e=>{
+  const r = canvas.getBoundingClientRect();
+  const mx = e.clientX - r.left;
+  const my = e.clientY - r.top;
+  const n = nodeAt(mx, my);
+  if(n){
+    selectedNode = n;
+    openDetail(n);
+  }
+});
+
+canvas.addEventListener('wheel', e=>{
+  e.preventDefault();
+  const r = canvas.getBoundingClientRect();
+  const mx = e.clientX - r.left;
+  const my = e.clientY - r.top;
+  const factor = e.deltaY < 0 ? 1.1 : .91;
+  const oldScale = scale;
+  scale = Math.min(3, Math.max(.3, scale * factor));
+  pan.x = mx - (mx - pan.x) * (scale/oldScale);
+  pan.y = my - (my - pan.y) * (scale/oldScale);
+},{passive:false});
+
+document.getElementById('detail-close').addEventListener('click', ()=>{
+  document.getElementById('detail').classList.remove('open');
+  selectedNode = null;
+});
+
+// ── DETAIL PANEL ────────────────────────────────────────────────────────
+function openDetail(n){
+  const d = n.detail;
+  if(!d) return;
+
+  document.getElementById('detail').classList.add('open');
+
+  const icon = document.getElementById('detail-icon');
+  icon.textContent = n.icon;
+  icon.style.background = hexToRgb(n.color, .15);
+  icon.style.border = `1px solid ${hexToRgb(n.color, .4)}`;
+
+  document.getElementById('detail-title').textContent = n.label;
+  document.getElementById('detail-title').style.color = n.color;
+  document.getElementById('detail-subtitle').textContent = n.subtitle;
+
+  const body = document.getElementById('detail-body');
+  let html = '';
+
+  // basic KV
+  const kvKeys = Object.keys(d).filter(k=>!['sections','relations'].includes(k));
+  if(kvKeys.length){
+    html += `<div class="detail-section">
+      <div class="detail-section-title">PROPERTIES</div>`;
+    for(const k of kvKeys){
+      html += `<div class="detail-kv">
+        <span class="detail-k">${k}</span>
+        <span class="detail-v mono">${d[k]}</span>
+      </div>`;
+    }
+    html += `</div>`;
+  }
+
+  // sections
+  if(d.sections){
+    for(const s of d.sections){
+      html += `<div class="detail-section">
+        <div class="detail-section-title">${s.title}</div>`;
+      if(s.items){
+        for(const [k,v] of s.items){
+          html += `<div class="detail-kv">
+            <span class="detail-k">${k}</span>
+            <span class="detail-v mono">${v}</span>
+          </div>`;
+        }
+      }
+      if(s.code){
+        html += `<div class="code-block">${s.code}</div>`;
+      }
+      if(s.steps){
+        html += `<div class="flow-steps">`;
+        s.steps.forEach((st, i)=>{
+          html += `<div class="flow-step">
+            <div class="step-num" style="background:${hexToRgb(n.color,.2)};color:${n.color}">${i+1}</div>
+            <div class="step-text">${st}</div>
+          </div>`;
+        });
+        html += `</div>`;
+      }
+      if(s.threats){
+        s.threats.forEach(t=>{
+          html += `<span class="threat-badge mitigated">✓ ${t}</span>`;
+        });
+      }
+      html += `</div>`;
+    }
+  }
+
+  // relations
+  if(d.relations && d.relations.length){
+    html += `<div class="detail-section">
+      <div class="detail-section-title">CONNECTED NODES</div>
+      <div class="relations-wrap">`;
+    for(const rid of d.relations){
+      const rn = NODES.find(n=>n.id===rid);
+      if(!rn) continue;
+      html += `<span class="relation-chip"
+        style="color:${rn.color};border-color:${hexToRgb(rn.color,.4)};background:${hexToRgb(rn.color,.08)}"
+        onclick="jumpTo('${rid}')">${rn.icon} ${rn.label}</span>`;
+    }
+    html += `</div></div>`;
+  }
+
+  body.innerHTML = html;
+}
+
+function jumpTo(id){
+  const n = NODES.find(n=>n.id===id);
+  if(!n) return;
+  // pan to center that node
+  pan.x = W/2 - n.x * W * scale;
+  pan.y = H/2 - n.y * H * scale;
+  selectedNode = n;
+  openDetail(n);
+}
+window.jumpTo = jumpTo;
+</script>
+</body>
+</html>
