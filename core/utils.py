@@ -31,6 +31,8 @@ _g_input_active : bool = False
 _g_header       : str  = ""
 _room_logs      : dict = defaultdict(list)
 _room_seen      : dict = defaultdict(set)
+_last_sender    : dict = defaultdict(lambda: None)
+_last_ts        : dict = defaultdict(lambda: None)
 _ephemeral_lines: dict = defaultdict(Counter)
 _current_room   : list = ["general"]
 _known_rooms    : list = []
@@ -391,6 +393,19 @@ def _animate_msg(prefix: str, plaintext: str, room: str,
 
 def _msg_prefix(from_user: str, timestamp: str, tag: str = "", is_own: bool = False) -> str:
     from core.colors import _sender_color
+    
+    room = _current_room[0]
+    last_sender = _last_sender[room]
+    last_ts = _last_ts[room]
+    
+    # Check if this is the same sender as the last message in this room
+    if from_user == last_sender and timestamp == last_ts:
+        # Suppress username and timestamp for grouped messages
+        return " " * 22  # Align with the length of the timestamp/username prefix
+    
+    _last_sender[room] = from_user
+    _last_ts[room] = timestamp
+    
     sc  = YELLOW if is_own else _sender_color(from_user)
     ts  = NE_TEXT_TER + f"[{timestamp}]" + RESET
     usr = BOLD + sc + from_user + RESET
